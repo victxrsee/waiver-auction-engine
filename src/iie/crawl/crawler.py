@@ -184,7 +184,9 @@ class Crawler:
             return
 
         self.store.add_league(raw)
-        self.frontier.set_league_state(league_id, "accepted", reason)
+        # The season was unknown when this league was queued from a
+        # previous_league_id; record it now or its rows cannot be joined.
+        self.frontier.set_league_state(league_id, "accepted", reason, season=raw.get("season"))
         previous = raw.get("previous_league_id")
         if previous and previous != "0" and not self.frontier.knows_league(previous):
             self.frontier.add_league(previous, None, state="discovered", depth=depth)
@@ -205,7 +207,12 @@ class Crawler:
 
         self.store.add_rosters(league_id, rosters)
 
-        season = season or ""
+        if not season:
+            # Should not happen now that discovery backfills it, but an unlabelled
+            # season must stay null rather than become "", which parses as neither
+            # a season nor a missing value downstream.
+            log.warning("league %s has no season; its rows will not be joinable", league_id)
+            season = None
         for week in self.policy.transaction_weeks:
             transactions = self.client.get_league_transactions(league_id, week)
             if transactions:

@@ -134,13 +134,32 @@ class Frontier:
             (state, limit),
         ).fetchall()
 
-    def set_league_state(self, league_id: str, state: str, reason: str | None = None) -> None:
+    def set_league_state(
+        self,
+        league_id: str,
+        state: str,
+        reason: str | None = None,
+        season: str | None = None,
+    ) -> None:
+        """Update a league's state, and its season if it was not known at discovery.
+
+        A league reached through ``previous_league_id`` is queued before anything
+        about it is known, season included. Backfilling it here is what keeps its
+        transactions labelled with a season they can be joined on.
+        """
         if state not in LEAGUE_STATES:
             raise ValueError(f"bad league state {state!r}; expected one of {LEAGUE_STATES}")
-        self.db.execute(
-            "UPDATE leagues SET state = ?, reason = ?, updated_at = ? WHERE league_id = ?",
-            (state, reason, time.time(), str(league_id)),
-        )
+        if season is None:
+            self.db.execute(
+                "UPDATE leagues SET state = ?, reason = ?, updated_at = ? WHERE league_id = ?",
+                (state, reason, time.time(), str(league_id)),
+            )
+        else:
+            self.db.execute(
+                "UPDATE leagues SET state = ?, reason = ?, season = ?, updated_at = ?"
+                " WHERE league_id = ?",
+                (state, reason, str(season), time.time(), str(league_id)),
+            )
         self.db.commit()
 
     def knows_league(self, league_id: str) -> bool:
