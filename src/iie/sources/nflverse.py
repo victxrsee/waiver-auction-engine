@@ -67,6 +67,8 @@ DATASETS: dict[str, Dataset] = {
     "player_week": Dataset("stats_player", "stats_player_week", 1999),
     "roster_weekly": Dataset("weekly_rosters", "roster_weekly", 2002),
     "players": Dataset("players", "players", None),
+    # Not season-partitioned: one file covers every season.
+    "schedules": Dataset("schedules", "games", None),
 }
 
 
