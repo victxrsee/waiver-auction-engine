@@ -37,6 +37,11 @@ class ClaimSpec:
     """Feature windows and the horizon a claim's value is judged over."""
 
     trailing_windows: tuple[int, ...] = (1, 3)
+    # Defenses are kept by default. They carry no player features -- nothing in
+    # nflverse is keyed on a team abbreviation -- but they are 12% of all claims,
+    # and a price model that predicts what leaguemates will bid needs no player
+    # features at all. Dropping them here would hide that gap instead of scoping it.
+    include_defense: bool = True
     # Six weeks is most of what remains of a mid-season roster spot, and short
     # enough that a claim in week 12 still has an outcome to be scored against.
     outcome_horizon: int = 6
@@ -104,17 +109,13 @@ def build_claims(
         return claims
 
     claims = attach_asof_week(claims, calendar)
-    claims["gsis_id"] = [
-        (r.gsis_id if (r := bridge.resolve(pid)) else None) for pid in claims["player_id"]
-    ]
-    resolved = claims["gsis_id"].notna()
-    log.info(
-        "bridge resolved %d/%d claims (%.1f%%)", resolved.sum(), len(claims), 100 * resolved.mean()
-    )
-    claims = claims[resolved].copy()
+    claims = _resolve_players(claims, bridge)
+
+    if not spec.include_defense:
+        claims = claims[~claims["is_defense"]].copy()
 
     seasons = sorted({int(s) for s in claims["season"].unique()})
-    panel = build_player_week(cache, seasons, gsis_ids=set(claims["gsis_id"]))
+    panel = build_player_week(cache, seasons, gsis_ids=set(claims["gsis_id"].dropna()))
     if panel.empty:
         log.warning("no nflverse player weeks for seasons %s", seasons)
         return pd.DataFrame()
@@ -146,6 +147,43 @@ def build_claims(
     check_no_lookahead(merged)
 
     return merged.reset_index(drop=True)
+
+
+def _resolve_players(claims: pd.DataFrame, bridge) -> pd.DataFrame:
+    """Attach gsis ids, separating unpriceable positions from real failures.
+
+    Three outcomes, and conflating them is how a whole position disappears
+    silently: ``resolved`` joins to nflverse, ``defense`` never will because
+    nothing there is keyed on a team abbreviation, and ``unresolved`` is a genuine
+    bridge miss worth watching.
+    """
+    out = claims.copy()
+    out["is_defense"] = [bridge.is_defense(pid) for pid in out["player_id"]]
+    out["gsis_id"] = [
+        None if is_def else (r.gsis_id if (r := bridge.resolve(pid)) else None)
+        for pid, is_def in zip(out["player_id"], out["is_defense"], strict=True)
+    ]
+
+    out["resolution"] = "resolved"
+    out.loc[out["is_defense"], "resolution"] = "defense"
+    out.loc[~out["is_defense"] & out["gsis_id"].isna(), "resolution"] = "unresolved"
+
+    counts = out["resolution"].value_counts()
+    total = len(out)
+    log.info(
+        "claims: %d resolved, %d defenses (unpriceable), %d unresolved (of %d)",
+        counts.get("resolved", 0),
+        counts.get("defense", 0),
+        counts.get("unresolved", 0),
+        total,
+    )
+    if counts.get("unresolved", 0):
+        log.warning(
+            "dropping %d claims whose players did not resolve (%.1f%%)",
+            counts["unresolved"],
+            100 * counts["unresolved"] / total,
+        )
+    return out[out["resolution"] != "unresolved"].copy()
 
 
 def _waiver_adds(transactions: pd.DataFrame, players: pd.DataFrame) -> pd.DataFrame:

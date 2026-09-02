@@ -53,8 +53,12 @@ class FakeCache:
 
 
 class FakeBridge:
-    def __init__(self, mapping):
+    def __init__(self, mapping, defenses=()):
         self.mapping = mapping
+        self.defenses = set(defenses)
+
+    def is_defense(self, sleeper_id):
+        return str(sleeper_id) in self.defenses
 
     def resolve(self, sleeper_id):
         gsis = self.mapping.get(str(sleeper_id))

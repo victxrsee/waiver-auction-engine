@@ -153,6 +153,19 @@ class PlayerIdBridge:
             log.info("name index: dropped %d ambiguous name/position keys", collisions)
         return {key: next(iter(ids)) for key, ids in buckets.items() if len(ids) == 1}
 
+    def is_defense(self, sleeper_id: str) -> bool:
+        """Whether a Sleeper id names a team defense rather than a person.
+
+        Sleeper uses the team abbreviation itself as the id for a defense ("LAC",
+        "GB"), so these have no counterpart in any player table and never resolve.
+        Distinguishing them from genuine resolution failures is what keeps a whole
+        unpriceable position from being mistaken for a broken bridge.
+        """
+        player = self._sleeper.get(str(sleeper_id)) or {}
+        if player.get("position") == "DEF":
+            return True
+        return "DEF" in (player.get("fantasy_positions") or [])
+
     def resolve(self, sleeper_id: str) -> Resolution | None:
         """Resolve one Sleeper player ID, trying each tier in confidence order."""
         sleeper_id = str(sleeper_id)
