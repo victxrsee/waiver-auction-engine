@@ -18,7 +18,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .cache import HttpCache, RateLimiter
+from .cache import DEFAULT_RATE_PER_SECOND, HttpCache, RateLimiter
 
 BASE_URL = "https://api.sleeper.app/v1"
 
@@ -36,7 +36,7 @@ class SleeperClient:
         cls,
         cache_root: Path | str,
         *,
-        per_second: float = 5.0,
+        per_second: float = DEFAULT_RATE_PER_SECOND,
     ) -> SleeperClient:
         return cls(HttpCache(cache_root, BASE_URL, rate_limiter=RateLimiter(per_second)))
 
