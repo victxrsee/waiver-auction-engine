@@ -1,0 +1,86 @@
+"""Sleeper read-only API client.
+
+Sleeper's v1 API needs no auth for any of these endpoints, which is the property
+that makes a league corpus obtainable at all. The user<->league traversal is
+bidirectional:
+
+    user -> /user/{id}/leagues/nfl/{season} -> leagues
+    league -> /league/{id}/users            -> users
+
+so the two together form a graph the crawler can walk.
+
+Nothing here persists data. The client returns raw API shapes; normalization and
+the decision about what is safe to store live in ``iie.crawl.store``.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from .cache import HttpCache, RateLimiter
+
+BASE_URL = "https://api.sleeper.app/v1"
+
+# A finished season never changes, so its responses are cached forever. Anything
+# fetched for the in-progress season should pass an explicit ttl.
+IMMUTABLE = None
+
+
+class SleeperClient:
+    def __init__(self, cache: HttpCache) -> None:
+        self.cache = cache
+
+    @classmethod
+    def build(
+        cls,
+        cache_root: Path | str,
+        *,
+        per_second: float = 5.0,
+    ) -> SleeperClient:
+        return cls(HttpCache(cache_root, BASE_URL, rate_limiter=RateLimiter(per_second)))
+
+    # --- entry points -----------------------------------------------------
+
+    def get_state(self, sport: str = "nfl") -> dict[str, Any] | None:
+        """Current week/season. Cheap; useful as a connectivity smoke test."""
+        return self.cache.get_json(f"state/{sport}", ttl=3600)
+
+    def get_user(self, username_or_id: str) -> dict[str, Any] | None:
+        return self.cache.get_json(f"user/{username_or_id}", ttl=IMMUTABLE)
+
+    # --- graph traversal --------------------------------------------------
+
+    def get_user_leagues(
+        self, user_id: str, season: str, sport: str = "nfl"
+    ) -> list[dict[str, Any]]:
+        got = self.cache.get_json(f"user/{user_id}/leagues/{sport}/{season}", ttl=IMMUTABLE)
+        return got or []
+
+    def get_league_users(self, league_id: str) -> list[dict[str, Any]]:
+        got = self.cache.get_json(f"league/{league_id}/users", ttl=IMMUTABLE)
+        return got or []
+
+    # --- league contents --------------------------------------------------
+
+    def get_league(self, league_id: str) -> dict[str, Any] | None:
+        return self.cache.get_json(f"league/{league_id}", ttl=IMMUTABLE)
+
+    def get_league_rosters(self, league_id: str) -> list[dict[str, Any]]:
+        got = self.cache.get_json(f"league/{league_id}/rosters", ttl=IMMUTABLE)
+        return got or []
+
+    def get_league_transactions(self, league_id: str, week: int) -> list[dict[str, Any]]:
+        got = self.cache.get_json(f"league/{league_id}/transactions/{week}", ttl=IMMUTABLE)
+        return got or []
+
+    def get_league_drafts(self, league_id: str) -> list[dict[str, Any]]:
+        got = self.cache.get_json(f"league/{league_id}/drafts", ttl=IMMUTABLE)
+        return got or []
+
+    def get_draft(self, draft_id: str) -> dict[str, Any] | None:
+        return self.cache.get_json(f"draft/{draft_id}", ttl=IMMUTABLE)
+
+    def get_draft_picks(self, draft_id: str) -> list[dict[str, Any]]:
+        got = self.cache.get_json(f"draft/{draft_id}/picks", ttl=IMMUTABLE)
+        return got or []
