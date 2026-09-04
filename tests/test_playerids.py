@@ -126,3 +126,57 @@ def test_bridge_degrades_without_optional_sources():
     bridge = PlayerIdBridge(SLEEPER)
     assert bridge.resolve("1").gsis_id == "00-0000001"
     assert bridge.resolve("2") is None
+
+
+# --- defenses and assembly --------------------------------------------------
+
+
+DEFENSE_SLEEPER = {
+    "LAC": {"full_name": None, "position": "DEF", "fantasy_positions": ["DEF"]},
+    "1": {"full_name": "Direct Guy", "position": "WR", "gsis_id": "00-0000001"},
+}
+
+
+def test_team_defenses_are_identified_not_treated_as_failures():
+    """Defenses use a team abbreviation as their id and never resolve by design."""
+    bridge = PlayerIdBridge(DEFENSE_SLEEPER)
+    assert bridge.is_defense("LAC") is True
+    assert bridge.is_defense("1") is False
+    assert bridge.resolve("LAC") is None
+
+
+def test_defense_detection_falls_back_to_fantasy_positions():
+    bridge = PlayerIdBridge({"SF": {"fantasy_positions": ["DEF"]}})
+    assert bridge.is_defense("SF") is True
+
+
+def test_unknown_id_is_not_a_defense():
+    assert PlayerIdBridge({}).is_defense("nobody") is False
+
+
+def test_build_bridge_assembles_from_the_client():
+    """Wiring this by hand is how the pipeline came to depend on a manual file."""
+    from iie.sources.playerids import build_bridge
+
+    class FakeCache:
+        session = None
+
+        def load(self, name, season=None, columns=None):
+            return pd.DataFrame(columns=["gsis_id", "display_name", "position"])
+
+    class FakeClient:
+        cache = FakeCache()
+
+        def get_players(self, sport="nfl"):
+            return DEFENSE_SLEEPER
+
+    import iie.sources.playerids as mod
+
+    original = mod.fetch_id_map
+    mod.fetch_id_map = lambda *a, **k: pd.DataFrame(columns=["sleeper_id", "gsis_id"])
+    try:
+        bridge = build_bridge(FakeClient(), "/nonexistent-unused", FakeCache())
+    finally:
+        mod.fetch_id_map = original
+    assert bridge.resolve("1").gsis_id == "00-0000001"
+    assert bridge.is_defense("LAC") is True

@@ -26,6 +26,11 @@ BASE_URL = "https://api.sleeper.app/v1"
 # fetched for the in-progress season should pass an explicit ttl.
 IMMUTABLE = None
 
+# The full player list is ~14MB and Sleeper asks callers to fetch it at most once
+# a day. It is also the only source of the cross-reference IDs the nflverse bridge
+# needs, so it belongs in the client rather than being fetched by hand.
+PLAYERS_TTL = 24 * 3600
+
 
 class SleeperClient:
     def __init__(self, cache: HttpCache) -> None:
@@ -48,6 +53,15 @@ class SleeperClient:
 
     def get_user(self, username_or_id: str) -> dict[str, Any] | None:
         return self.cache.get_json(f"user/{username_or_id}", ttl=IMMUTABLE)
+
+    def get_players(self, sport: str = "nfl") -> dict[str, dict[str, Any]]:
+        """Every player Sleeper knows, keyed by its own player_id.
+
+        Large and slow-moving, so it is cached for a day. Team defenses appear
+        here too, keyed by team abbreviation rather than a player id.
+        """
+        got = self.cache.get_json(f"players/{sport}", ttl=PLAYERS_TTL)
+        return got or {}
 
     # --- graph traversal --------------------------------------------------
 

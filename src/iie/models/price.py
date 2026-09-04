@@ -148,6 +148,36 @@ class ComparablesPrice:
         return self._table.reindex(index).fillna(self._fallback).to_numpy()
 
 
+@dataclass(frozen=True)
+class BidSchedule:
+    """Per-row price quantile curves, evaluated at any confidence for free.
+
+    The curves do not depend on the confidence asked for, so sweeping a range of
+    operating points -- which is the only fair way to compare bidding policies --
+    should cost one set of model predictions, not one per point.
+    """
+
+    probability: np.ndarray
+    grid: np.ndarray
+    curves: np.ndarray
+
+    def at(self, confidence: float) -> np.ndarray:
+        """Bid amounts that win about ``confidence`` of auctions."""
+        with np.errstate(divide="ignore", invalid="ignore"):
+            needed = np.where(self.probability > 0, 1 - (1 - confidence) / self.probability, -1.0)
+
+        wanted = np.clip(needed, self.grid[0], self.grid[-1])
+        upper = np.clip(np.searchsorted(self.grid, wanted), 1, len(self.grid) - 1)
+        low, high = self.grid[upper - 1], self.grid[upper]
+        weight = np.where(high > low, (wanted - low) / (high - low), 0.0)
+
+        rows = np.arange(len(self.probability))
+        out = self.curves[rows, upper - 1] * (1 - weight) + self.curves[rows, upper] * weight
+        # A non-positive requirement means the odds of facing nobody already cover
+        # the target confidence, so a minimal bid suffices.
+        return np.where(needed > 0, out, 0.0)
+
+
 @dataclass
 class HurdlePrice:
     """Classifier for whether anyone else bids, regressor for how much.
@@ -217,23 +247,18 @@ class HurdlePrice:
         regressions fitted on contested auctions, interpolated across the grid,
         rather than from an assumed distributional shape.
         """
+        return self.bid_schedule(frame).at(confidence)
+
+    def bid_schedule(self, frame: pd.DataFrame) -> BidSchedule:
+        """Run the models once, so a confidence sweep costs array arithmetic."""
         matrix = _design_matrix(frame)
-        probability = self.classifier.predict_proba(matrix)[:, 1]
-
-        with np.errstate(divide="ignore", invalid="ignore"):
-            needed = np.where(probability > 0, 1 - (1 - confidence) / probability, -1.0)
-
-        grid = np.array(self.quantile_levels)
-        curves = np.column_stack(
-            [np.clip(model.predict(matrix), 0.0, None) for model in self._quantile_models]
+        return BidSchedule(
+            probability=self.classifier.predict_proba(matrix)[:, 1],
+            grid=np.asarray(self.quantile_levels),
+            curves=np.column_stack(
+                [np.clip(model.predict(matrix), 0.0, None) for model in self._quantile_models]
+            ),
         )
-
-        out = np.zeros(len(frame))
-        for row in range(len(frame)):
-            if needed[row] <= 0:
-                continue
-            out[row] = np.interp(min(needed[row], grid[-1]), grid, curves[row])
-        return out
 
 
 def simulate_policy(

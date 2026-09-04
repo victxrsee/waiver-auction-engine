@@ -12,6 +12,7 @@ import pandas as pd
 import pytest
 
 from iie.models.price import (
+    BidSchedule,
     ComparablesPrice,
     HurdlePrice,
     build_auction_table,
@@ -187,3 +188,22 @@ def test_evaluate_reports_error_and_ranking():
     metrics = evaluate(np.array([0.0, 0.1, 0.2, 0.3]), truth)
     assert metrics["mae"] == 0.0
     assert metrics["spearman"] == pytest.approx(1.0)
+
+
+# --- bid schedule -----------------------------------------------------------
+
+
+def test_bid_schedule_matches_direct_prediction():
+    """Precomputing the curves must not change the answer, only the cost."""
+    frame, target = _training_frame()
+    model = HurdlePrice().fit(frame, target)
+    schedule = model.bid_schedule(frame)
+    assert isinstance(schedule, BidSchedule)
+    assert np.allclose(schedule.at(0.85), model.predict_to_win(frame, 0.85))
+
+
+def test_bid_schedule_is_monotone_in_confidence():
+    frame, target = _training_frame()
+    schedule = HurdlePrice().fit(frame, target).bid_schedule(frame)
+    means = [schedule.at(c).mean() for c in (0.6, 0.7, 0.8, 0.9, 0.95)]
+    assert means == sorted(means)

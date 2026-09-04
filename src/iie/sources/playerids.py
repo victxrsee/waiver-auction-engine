@@ -88,6 +88,21 @@ def fetch_id_map(cache_dir: Path | str, *, session: requests.Session | None = No
     return pd.read_csv(target, low_memory=False)
 
 
+def build_bridge(client, id_cache_dir: Path | str, nflverse_cache) -> PlayerIdBridge:
+    """Assemble the bridge from its three sources.
+
+    All three are cached, so this is cheap to call repeatedly: Sleeper's player
+    list for a day, the crosswalk for a day, and the nflverse players table until
+    its TTL expires. Wiring them by hand is how the pipeline ended up depending on
+    a file someone had fetched manually.
+    """
+    return PlayerIdBridge(
+        client.get_players(),
+        id_map=fetch_id_map(id_cache_dir, session=client.cache.session),
+        nflverse_players=nflverse_cache.load("players"),
+    )
+
+
 @dataclass(frozen=True)
 class Resolution:
     """A resolved player, tagged with the tier that resolved it."""
