@@ -178,11 +178,14 @@ def test_league_context_defaults_when_settings_are_unparseable():
             "league_id": ["A", "B"],
             "scoring_settings_json": ["{}", "not json"],
             "settings_json": ["{}", "not json"],
+            "total_rosters": [12, 10],
         }
     )
     context = _league_context(leagues)
     assert context["reception_points"].tolist() == [0.0, 0.0]
     assert context["waiver_budget"].isna().all()
+    # League size is carried through even when the settings blobs are unusable.
+    assert context["total_rosters"].tolist() == [12, 10]
 
 
 def test_bid_is_expressed_as_a_share_of_budget(tmp_path):

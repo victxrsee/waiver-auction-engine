@@ -55,6 +55,9 @@ DEFAULT_RECEPTION_POINTS = 0.0
 def _league_context(leagues: pd.DataFrame) -> pd.DataFrame:
     """Per-league scoring and FAAB budget, from the stored settings blobs.
 
+    League size matters too, and is carried here for the same reason: it is a
+    model feature, and a feature that is declared but never joined trains nothing.
+
     The budget matters as much as the scoring. Bids are denominated in each
     league's own currency, and pooling raw amounts across leagues destroys the
     signal: measured on the corpus, bid-vs-realized-value correlation is +0.045
@@ -62,6 +65,7 @@ def _league_context(leagues: pd.DataFrame) -> pd.DataFrame:
     a 100 budget but some run 1000, so a bid of 50 means entirely different
     things in each.
     """
+    sizes = pd.to_numeric(leagues["total_rosters"], errors="coerce")
     points, budgets = [], []
     for scoring, settings in zip(
         leagues["scoring_settings_json"], leagues["settings_json"], strict=True
@@ -81,6 +85,10 @@ def _league_context(leagues: pd.DataFrame) -> pd.DataFrame:
             "league_id": leagues["league_id"],
             "reception_points": points,
             "waiver_budget": budgets,
+            # League size is a first-order driver of price -- a player is scarcer
+            # in a 14-team league than a 10-team one -- and it was declared as a
+            # model feature long before anything actually joined it on.
+            "total_rosters": sizes.to_numpy(),
         }
     )
 
@@ -141,9 +149,11 @@ def build_claims(
     budget = merged["waiver_budget"].where(merged["waiver_budget"] > 0)
     merged["bid_pct"] = merged["waiver_bid"] / budget
 
-    # Trailing features are joined at asof_week by construction; the assertion is
-    # a regression guard against a future change that joins on the label instead.
-    merged["feature_week"] = merged["asof_week"]
+    # Read the week back from the *panel* side of the join rather than copying
+    # asof_week. Copying it made the assertion compare a column to itself, so it
+    # would still have passed if the merge were changed to join on the Sleeper
+    # week label -- which is exactly the regression it exists to catch.
+    merged["feature_week"] = merged["week_panel"]
     check_no_lookahead(merged)
 
     return merged.reset_index(drop=True)

@@ -327,7 +327,11 @@ class _TableWriter:
         # Written under a temp name and renamed, so a crawl killed mid-flush never
         # leaves a truncated file that poisons the whole dataset on read.
         final = self.directory / f"part-{uuid.uuid4().hex}.parquet"
-        tmp = final.with_suffix(".parquet.tmp")
+        # Leading dot: pyarrow's dataset discovery skips hidden files, so a crawl
+        # killed mid-write leaves a stray temp file that read_table ignores. Named
+        # "part-....parquet.tmp" it would instead be opened as part of the dataset
+        # and raise on every read until someone deleted it by hand.
+        tmp = self.directory / f".{final.name}.tmp"
         pq.write_table(table, tmp, compression="zstd")
         tmp.replace(final)
         self.rows_written += len(self._buffer)

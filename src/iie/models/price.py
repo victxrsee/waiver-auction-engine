@@ -97,16 +97,50 @@ def build_auction_table(claims: pd.DataFrame) -> pd.DataFrame:
     return auctions.reset_index(drop=True)
 
 
-def _design_matrix(frame: pd.DataFrame) -> pd.DataFrame:
+def _design_matrix(
+    frame: pd.DataFrame, vocabulary: dict[str, list[str]] | None = None
+) -> pd.DataFrame:
     """Feature matrix. Gradient boosting takes the NaNs natively, which matters
-    because defenses legitimately have no player features at all."""
-    columns = [c for c in FEATURE_COLUMNS if c in frame.columns]
-    matrix = frame[columns].apply(pd.to_numeric, errors="coerce")
+    because defenses legitimately have no player features at all.
+
+    ``vocabulary`` pins the categorical levels recorded at fit time. Without it,
+    ``.astype("category")`` derives codes from whatever frame it is handed, so a
+    split missing a rare position renumbers every position above it and the model
+    is scored on integers it never saw. A single-row frame -- the actual inference
+    call -- is the degenerate case: every position becomes code 0.
+    """
+    missing = [c for c in FEATURE_COLUMNS if c not in frame.columns]
+    if missing:
+        raise KeyError(
+            f"declared features absent from the frame: {missing}. Add them upstream or "
+            f"remove them from FEATURE_COLUMNS -- silently training on fewer features "
+            f"than declared is how a feature goes missing unnoticed."
+        )
+
+    matrix = frame[list(FEATURE_COLUMNS)].apply(pd.to_numeric, errors="coerce")
 
     for column in CATEGORICAL_COLUMNS:
-        if column in frame.columns:
+        if column not in frame.columns:
+            continue
+        levels = None if vocabulary is None else vocabulary.get(column)
+        if levels is None:
             matrix[column] = frame[column].astype("category").cat.codes.replace(-1, np.nan)
+            continue
+        # Explicit lookup rather than a CategoricalDtype cast: an unseen level maps
+        # to NaN, which the boosted trees handle natively, instead of shifting the
+        # codes of every level around it. Using "string" keeps nulls as nulls.
+        lookup = {level: code for code, level in enumerate(levels)}
+        matrix[column] = frame[column].astype("string").map(lookup).astype("Float64")
     return matrix
+
+
+def _fit_vocabulary(frame: pd.DataFrame) -> dict[str, list[str]]:
+    """Categorical levels observed at fit time, to be reused at predict time."""
+    return {
+        column: sorted(frame[column].dropna().astype(str).unique())
+        for column in CATEGORICAL_COLUMNS
+        if column in frame.columns
+    }
 
 
 class ComparablesPrice:
@@ -195,9 +229,14 @@ class HurdlePrice:
     classifier: HistGradientBoostingClassifier | None = field(default=None, repr=False)
     regressor: HistGradientBoostingRegressor | None = field(default=None, repr=False)
     _quantile_models: list = field(default_factory=list, repr=False)
+    # Categorical levels seen at fit time, replayed at predict time so codes mean
+    # the same thing in both. Without this the model is scored on integers it was
+    # never fitted on.
+    _vocabulary: dict[str, list[str]] = field(default_factory=dict, repr=False)
 
     def fit(self, frame: pd.DataFrame, target: pd.Series) -> HurdlePrice:
-        matrix = _design_matrix(frame)
+        self._vocabulary = _fit_vocabulary(frame)
+        matrix = _design_matrix(frame, self._vocabulary)
         contested = (target > 0).astype(int)
 
         self.classifier = HistGradientBoostingClassifier(
@@ -223,7 +262,7 @@ class HurdlePrice:
         return self
 
     def predict_parts(self, frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-        matrix = _design_matrix(frame)
+        matrix = _design_matrix(frame, self._vocabulary)
         probability = self.classifier.predict_proba(matrix)[:, 1]
         amount = np.clip(self.regressor.predict(matrix), 0.0, None)
         return probability, amount
@@ -251,7 +290,7 @@ class HurdlePrice:
 
     def bid_schedule(self, frame: pd.DataFrame) -> BidSchedule:
         """Run the models once, so a confidence sweep costs array arithmetic."""
-        matrix = _design_matrix(frame)
+        matrix = _design_matrix(frame, self._vocabulary)
         return BidSchedule(
             probability=self.classifier.predict_proba(matrix)[:, 1],
             grid=np.asarray(self.quantile_levels),
@@ -271,21 +310,26 @@ def simulate_policy(
     and what each win costs. Absolute error against the price does not capture
     either: a bid one cent short loses everything, and a bid far above wins but
     overpays.
+
+    An uncontested auction is won by *any* bid, zero included -- there is no rival
+    to beat, and Sleeper awards it on waiver priority. Scoring those with a strict
+    ``>`` silently discards every claim a policy wins for free, which is most of
+    them: four auctions in five are uncontested, and a model that correctly bids
+    nothing on them would be recorded as losing all of them.
     """
     bids = np.asarray(bids, dtype=float)
     price = auctions[price_col].to_numpy(dtype=float)
+    contested = price > 0
 
-    # Strictly greater: an equal bid is a tie, and Sleeper breaks ties on waiver
-    # priority rather than price. Treating ties as losses keeps the estimate
-    # conservative rather than crediting wins the policy may not get.
-    won = bids > price
+    # Contested auctions need a strictly higher bid: an equal bid is a tie, broken
+    # on waiver priority rather than price, and counting ties as losses keeps the
+    # estimate conservative. Uncontested auctions have no rival to outbid.
+    won = np.where(contested, bids > price, True)
     spend = np.where(won, bids, 0.0)
     wins = int(won.sum())
 
-    # Four auctions in five are uncontested, where any positive bid wins. Pooling
-    # them makes every policy look good, so the contested subset is reported
-    # separately: that is where a price model actually earns its keep.
-    contested = price > 0
+    # Pooling uncontested auctions makes every policy look good, so the contested
+    # subset is reported separately: that is where a price model earns its keep.
     contested_wins = int((won & contested).sum())
 
     return {
