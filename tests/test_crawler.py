@@ -239,6 +239,54 @@ def test_graph_expands_through_league_membership(wiring):
     assert frontier.counts()["users_total"] == 3
 
 
+def test_a_full_queue_does_not_starve_user_expansion(wiring):
+    """Breadth must not depend on the fetch queue running dry.
+
+    Discovering only below the low water mark makes the walk depth-first: the
+    queue stays full, so the crawler keeps fetching leagues from the neighbourhood
+    it is already in and never expands a new user. Measured on the real crawl that
+    left 139 users expanded against 20,590 pending, with one manager supplying 30%
+    of all claims -- a corpus far narrower than its league count suggests.
+    """
+    many = [league(f"L{i}") for i in range(12)]
+    client = FakeClient(
+        user_leagues={("uid-me", "2025"): many, ("u1", "2025"): []},
+        rosters={f"L{i}": ACTIVE_ROSTERS for i in range(12)},
+        # Every league carries the same leaguemate, discoverable only by expanding.
+        members={f"L{i}": [{"user_id": "u1"}] for i in range(12)},
+    )
+    policy = CrawlPolicy(seasons=("2025",), expand_every=4, low_water_mark=1)
+    crawler, store, _frontier = wiring(client, policy)
+    crawler.seed_username("me")
+    report = crawler.run()
+    store.close()
+    # The queue never drops to the low water mark, so without the cadence the seed
+    # would be the only user ever expanded.
+    assert report.users_expanded > 1, "a full queue starved discovery entirely"
+
+
+def test_expansion_cadence_can_be_disabled(wiring):
+    """expand_every=0 restores the pure low-water-mark behaviour.
+
+    The crawl stops on its target with leagues still queued, so the terminal
+    "nothing left to fetch" expansion never fires and the cadence is the only
+    thing that could have expanded a second user.
+    """
+    many = [league(f"L{i}") for i in range(6)]
+    client = FakeClient(
+        user_leagues={("uid-me", "2025"): many, ("u1", "2025"): []},
+        rosters={f"L{i}": ACTIVE_ROSTERS for i in range(6)},
+        members={f"L{i}": [{"user_id": "u1"}] for i in range(6)},
+    )
+    policy = CrawlPolicy(seasons=("2025",), expand_every=0, low_water_mark=0, target_leagues=4)
+    crawler, store, _frontier = wiring(client, policy)
+    crawler.seed_username("me")
+    report = crawler.run()
+    store.close()
+    assert report.stopped_because == "target_reached"
+    assert report.users_expanded == 1
+
+
 def test_previous_league_id_is_queued_and_screened(wiring):
     """History is the cheapest data available; it must be followed."""
     client = FakeClient(
