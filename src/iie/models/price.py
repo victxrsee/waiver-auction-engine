@@ -57,7 +57,7 @@ FEATURE_COLUMNS = (
     "reception_points",
     "waiver_budget",
     "is_defense",
-    # Opportunity shocks. depth_promotion and demand_prior are here because they
+    # Opportunity shocks. depth_promotion and demand_share are here because they
     # move price hard while barely moving realized value -- a just-promoted starter
     # costs 66% more and returns 26% less -- so a price model that cannot see them
     # is blind to most of what the market is actually reacting to.
@@ -65,7 +65,18 @@ FEATURE_COLUMNS = (
     "depth_size",
     "depth_promotion",
     "depth_is_starter",
-    "demand_prior",
+    "demand_share",
+    "injury_severity",
+)
+
+# The Phase 1 additions, named so they can be ablated as a family. They are what
+# distinguishes "the market reacts to news" from "the market reacts to box scores".
+OPPORTUNITY_COLUMNS = (
+    "depth_rank",
+    "depth_size",
+    "depth_promotion",
+    "depth_is_starter",
+    "demand_share",
     "injury_severity",
 )
 
@@ -108,7 +119,9 @@ def build_auction_table(claims: pd.DataFrame) -> pd.DataFrame:
 
 
 def _design_matrix(
-    frame: pd.DataFrame, vocabulary: dict[str, list[str]] | None = None
+    frame: pd.DataFrame,
+    vocabulary: dict[str, list[str]] | None = None,
+    features: tuple[str, ...] = FEATURE_COLUMNS,
 ) -> pd.DataFrame:
     """Feature matrix. Gradient boosting takes the NaNs natively, which matters
     because defenses legitimately have no player features at all.
@@ -118,8 +131,13 @@ def _design_matrix(
     split missing a rare position renumbers every position above it and the model
     is scored on integers it never saw. A single-row frame -- the actual inference
     call -- is the degenerate case: every position becomes code 0.
+
+    ``features`` narrows the column set, which exists so a feature family can be
+    ablated through the same code path that trains the real model. Measuring what
+    a feature contributes by editing the module constant measures a different
+    program than the one that ships.
     """
-    missing = [c for c in FEATURE_COLUMNS if c not in frame.columns]
+    missing = [c for c in features if c not in frame.columns]
     if missing:
         raise KeyError(
             f"declared features absent from the frame: {missing}. Add them upstream or "
@@ -127,7 +145,7 @@ def _design_matrix(
             f"than declared is how a feature goes missing unnoticed."
         )
 
-    matrix = frame[list(FEATURE_COLUMNS)].apply(pd.to_numeric, errors="coerce")
+    matrix = frame[list(features)].apply(pd.to_numeric, errors="coerce")
 
     for column in CATEGORICAL_COLUMNS:
         if column not in frame.columns:
@@ -236,6 +254,9 @@ class HurdlePrice:
     # Conditional price quantiles are fitted on a grid and interpolated between,
     # so no distributional shape has to be assumed for the tail.
     quantile_levels: tuple[float, ...] = (0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99)
+    # Narrowing this is how a feature family is ablated; the fitted model carries
+    # its own column list so predict cannot silently use a different one.
+    features: tuple[str, ...] = FEATURE_COLUMNS
     classifier: HistGradientBoostingClassifier | None = field(default=None, repr=False)
     regressor: HistGradientBoostingRegressor | None = field(default=None, repr=False)
     _quantile_models: list = field(default_factory=list, repr=False)
@@ -246,7 +267,7 @@ class HurdlePrice:
 
     def fit(self, frame: pd.DataFrame, target: pd.Series) -> HurdlePrice:
         self._vocabulary = _fit_vocabulary(frame)
-        matrix = _design_matrix(frame, self._vocabulary)
+        matrix = _design_matrix(frame, self._vocabulary, self.features)
         contested = (target > 0).astype(int)
 
         self.classifier = HistGradientBoostingClassifier(
@@ -272,7 +293,7 @@ class HurdlePrice:
         return self
 
     def predict_parts(self, frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-        matrix = _design_matrix(frame, self._vocabulary)
+        matrix = _design_matrix(frame, self._vocabulary, self.features)
         probability = self.classifier.predict_proba(matrix)[:, 1]
         amount = np.clip(self.regressor.predict(matrix), 0.0, None)
         return probability, amount
@@ -300,7 +321,7 @@ class HurdlePrice:
 
     def bid_schedule(self, frame: pd.DataFrame) -> BidSchedule:
         """Run the models once, so a confidence sweep costs array arithmetic."""
-        matrix = _design_matrix(frame, self._vocabulary)
+        matrix = _design_matrix(frame, self._vocabulary, self.features)
         return BidSchedule(
             probability=self.classifier.predict_proba(matrix)[:, 1],
             grid=np.asarray(self.quantile_levels),

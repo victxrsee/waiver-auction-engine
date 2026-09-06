@@ -53,6 +53,11 @@ log = logging.getLogger(__name__)
 # every kicker silently.
 FANTASY_POSITIONS = ("QB", "RB", "WR", "TE", "FB", "PK", "K")
 
+# Return and holder roles in the legacy schema. Being first-choice punt returner
+# says nothing about a player's offensive depth, which is the thing being measured.
+# "K"/"PK" are absent deliberately: for a kicker that is the real position.
+SPECIAL_TEAMS_ROLES = frozenset({"PR", "KR", "KOR", "KO", "P", "H", "LS"})
+
 # Ordered by severity so the code is monotone: a larger number is worse news about
 # this player's own availability.
 INJURY_SEVERITY = {
@@ -114,11 +119,18 @@ def _normalise_legacy_charts(charts: pd.DataFrame) -> pd.DataFrame:
     if "game_type" in charts.columns:
         charts = charts[charts["game_type"] == "REG"]
     charts = charts[charts["position"].isin(FANTASY_POSITIONS)]
+    # A player is listed once per role, and the return roles are the trap: a WR who
+    # is his club's first-choice punt returner is PR1, and taking the best rank over
+    # all his roles promotes him to WR1. That made 52% of 2024 claims read as
+    # starters against 36% of 2025's -- a fabricated distribution shift across the
+    # train/test boundary, in the feature the model leans on hardest.
+    if "depth_position" in charts.columns:
+        charts = charts[~charts["depth_position"].isin(SPECIAL_TEAMS_ROLES)]
     charts = charts.dropna(subset=["gsis_id", "week"]).copy()
 
     charts["pos_rank"] = pd.to_numeric(charts["depth_team"], errors="coerce")
     charts = charts.dropna(subset=["pos_rank"])
-    # A player is listed once per role (RB and KR, say); his depth is the best of them.
+    # What remains is his offensive depth, best across however it is spelled.
     charts = charts.groupby(["gsis_id", "season", "week", "club_code", "position"], as_index=False)[
         "pos_rank"
     ].min()
@@ -176,25 +188,43 @@ def build_depth_charts(cache, seasons: list[int], calendar) -> pd.DataFrame:
     return charts[columns].reset_index(drop=True)
 
 
+def _regular_season(frame: pd.DataFrame) -> pd.DataFrame:
+    """Regular-season rows, using whichever column this season's schema carries.
+
+    2024 has ``game_type`` only; 2025 has both it and ``season_type``. The choice
+    has to be made per season, before any concatenation -- see ``build_injury_status``.
+    """
+    for column in ("season_type", "game_type"):
+        if column in frame.columns:
+            return frame[frame[column].isin(("REG",))]
+    return frame
+
+
 def build_injury_status(cache, seasons: list[int]) -> pd.DataFrame:
-    """Weekly injury report, reduced to a severity code per player-week."""
+    """Weekly injury report, reduced to a severity code per player-week.
+
+    Each season is filtered *before* the concatenation, not after. nflverse added
+    ``season_type`` in 2025, so a post-concat filter on it silently discards every
+    2024 row -- the column exists on the combined frame only because 2025 supplied
+    it, and 2024's rows are all NaN there. That is the same trap the two depth-chart
+    normalisers exist to avoid, and it cost the whole training season once already:
+    ``injury_severity`` was uniformly 0.0 across 2024 while looking perfectly healthy.
+    """
     frames = []
     for season in seasons:
         try:
-            frames.append(cache.load("injuries", season))
+            raw = cache.load("injuries", season)
         except (FileNotFoundError, ValueError) as exc:
             log.warning("no injury report for %s: %s", season, exc)
+            continue
+        if not raw.empty and "report_status" in raw.columns:
+            frames.append(_regular_season(raw))
+
+    frames = [f for f in frames if not f.empty]
     if not frames:
         return pd.DataFrame(columns=["gsis_id", "season", "week", "injury_severity"])
 
-    injuries = pd.concat(frames, ignore_index=True)
-    if injuries.empty or "report_status" not in injuries.columns:
-        return pd.DataFrame(columns=["gsis_id", "season", "week", "injury_severity"])
-
-    injuries = injuries.dropna(subset=["gsis_id"])
-    # Same trap as above: .get returns the string default when absent.
-    if "season_type" in injuries.columns:
-        injuries = injuries[injuries["season_type"] == "REG"]
+    injuries = pd.concat(frames, ignore_index=True).dropna(subset=["gsis_id"])
     injuries["injury_severity"] = (
         injuries["report_status"].map(INJURY_SEVERITY).fillna(0.0).astype(float)
     )
@@ -279,16 +309,24 @@ def attach_injury_features(
 def attach_cross_league_demand(
     claims: pd.DataFrame, *, created_col: str = "created_ms"
 ) -> pd.DataFrame:
-    """How many other leagues had already claimed this player, before this claim.
+    """What *share* of leagues had already claimed this player, before this claim.
 
     The historical stand-in for a news feed. Strictly backward-looking: a claim is
     counted only if it happened before the one being scored. Leagues are counted
     once each, so a single contested auction with five bidders is one league's
     worth of demand rather than five.
+
+    A share rather than a count, because the count is not a property of the player
+    at all -- it is a property of how many leagues the crawler happened to reach
+    that season. The corpus holds 174 leagues in 2024 and 1,823 in 2025, so the raw
+    count averaged 8.6 in training and 278 in test: the model learned thresholds on
+    a scale that did not exist in the season it was scored on. Dividing by the
+    leagues active that week makes the feature mean the same thing in both, and
+    survives the corpus growing again.
     """
     out = claims.copy()
     if out.empty:
-        out["demand_prior"] = np.nan
+        out["demand_share"] = np.nan
         return out
 
     # One row per (season, player, league) claim event, at its earliest timestamp:
@@ -307,7 +345,8 @@ def attach_cross_league_demand(
     ).set_axis(out.index)
     # A league's own earlier bidders must not count toward its own demand, so the
     # count is taken at the league's first claim on that player.
-    merged["demand_prior"] = merged["prior_leagues"].astype(float)
+    active = out.groupby(["season", "week"])["league_id"].transform("nunique").astype(float)
+    merged["demand_share"] = merged["prior_leagues"].astype(float) / active.where(active > 0)
     return merged.drop(columns=["prior_leagues", "_first_claim"])
 
 

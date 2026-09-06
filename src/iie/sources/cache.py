@@ -116,8 +116,12 @@ class HttpCache:
         tmp = f.with_suffix(".tmp")
         tmp.write_text(
             json.dumps(
-                {"path": path, "status": entry.status, "body": entry.body,
-                 "fetched_at": entry.fetched_at}
+                {
+                    "path": path,
+                    "status": entry.status,
+                    "body": entry.body,
+                    "fetched_at": entry.fetched_at,
+                }
             )
         )
         tmp.replace(f)  # atomic, so an interrupted crawl never leaves half a file
@@ -162,4 +166,6 @@ class HttpCache:
             resp.raise_for_status()
             return CachedResponse(resp.status_code, resp.json(), time.time())
 
-        raise RuntimeError(f"giving up after {self.max_retries} attempts (last={last_status}): {url}")
+        raise RuntimeError(
+            f"giving up after {self.max_retries} attempts (last={last_status}): {url}"
+        )

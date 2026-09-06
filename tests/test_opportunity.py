@@ -10,6 +10,7 @@ lookahead.
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from iie.features.opportunity import (
     attach_cross_league_demand,
@@ -76,10 +77,13 @@ def test_both_nflverse_schemas_are_normalised_to_one_shape():
     assert set(charts.columns) >= {"gsis_id", "season", "week", "club", "pos_abb", "pos_rank"}
 
 
-def test_legacy_rows_take_the_best_rank_across_roles():
-    """A 2024 player is listed once per role -- RB2 and KR1 -- and his depth is the best."""
+def test_return_roles_do_not_promote_a_player():
+    """p1 is RB2 and KR1. Taking the best rank over all his roles would call him a
+    starter, but returning kicks is not offensive depth -- and doing so made 52% of
+    2024 claims read as starters against 36% of 2025's, a distribution shift
+    manufactured entirely by the schema difference."""
     charts = build_depth_charts(FakeCache({2024: LEGACY}), [2024], FakeCalendar())
-    assert charts.set_index("gsis_id").loc["p1", "pos_rank"] == 1
+    assert charts.set_index("gsis_id").loc["p1", "pos_rank"] == 2
 
 
 def test_legacy_postseason_rows_are_excluded():
@@ -237,27 +241,57 @@ DEMAND_CLAIMS = pd.DataFrame(
 def test_demand_counts_leagues_not_bidders():
     """Two bidders inside one league are one league's demand, not two."""
     out = attach_cross_league_demand(DEMAND_CLAIMS)
-    by_league = out.set_index("league_id")["demand_prior"]
-    assert by_league.loc["L2"] == 1.0, "only L1 preceded it"
-    assert by_league.loc["L3"] == 2.0, "L1 and L2 preceded it"
+    by_league = out.set_index("league_id")["demand_share"]
+    # Three leagues are active in the week, so the shares are thirds.
+    assert by_league.loc["L2"] == pytest.approx(1 / 3), "only L1 preceded it"
+    assert by_league.loc["L3"] == pytest.approx(2 / 3), "L1 and L2 preceded it"
+
+
+def _corpus(n_leagues: int, claiming: int) -> pd.DataFrame:
+    """`claiming` of `n_leagues` claim player 'a'; the rest claim someone else."""
+    return pd.DataFrame(
+        {
+            "season": ["2025"] * n_leagues,
+            "week": [6] * n_leagues,
+            "player_id": ["a"] * claiming + ["z"] * (n_leagues - claiming),
+            "league_id": [f"L{i}" for i in range(n_leagues)],
+            "created_ms": list(range(n_leagues)),
+        }
+    )
+
+
+def test_demand_is_a_share_so_it_survives_the_corpus_growing():
+    """Half the leagues want him, in a corpus and in one four times its size.
+
+    As a raw count this is the same fact reported as 12 and as 49, and the price
+    model trains on the season the crawler reached 174 leagues in and is scored on
+    the one it reached 1,823 in. The share is the same fact either way.
+    """
+    small = attach_cross_league_demand(_corpus(50, 25))
+    big = attach_cross_league_demand(_corpus(200, 100))
+
+    def mean_share(frame):
+        return frame[frame.player_id == "a"]["demand_share"].mean()
+
+    assert mean_share(big) == pytest.approx(mean_share(small), abs=0.02)
 
 
 def test_the_first_league_to_claim_sees_no_prior_demand():
     out = attach_cross_league_demand(DEMAND_CLAIMS)
-    assert out[out.league_id == "L1"]["demand_prior"].iloc[0] == 0.0
+    assert out[out.league_id == "L1"]["demand_share"].iloc[0] == 0.0
 
 
 def test_a_leagues_own_later_bidders_share_its_count():
     """Both L1 rows describe one league's decision, so both carry the same demand."""
     out = attach_cross_league_demand(DEMAND_CLAIMS)
-    l1 = out[(out.league_id == "L1") & (out.player_id == "a")]["demand_prior"]
+    l1 = out[(out.league_id == "L1") & (out.player_id == "a")]["demand_share"]
     assert l1.nunique() == 1
 
 
 def test_demand_is_scoped_to_the_player_and_week():
     """A player claimed widely in week 2 says nothing about his price in week 10."""
     out = attach_cross_league_demand(DEMAND_CLAIMS)
-    assert out[out.player_id == "b"]["demand_prior"].iloc[0] == 0.0
+    assert out[out.player_id == "b"]["demand_share"].iloc[0] == 0.0
 
 
 def test_demand_preserves_row_order():
@@ -267,4 +301,4 @@ def test_demand_preserves_row_order():
 
 def test_empty_claims_do_not_crash():
     empty = DEMAND_CLAIMS.iloc[:0]
-    assert attach_cross_league_demand(empty)["demand_prior"].empty
+    assert attach_cross_league_demand(empty)["demand_share"].empty

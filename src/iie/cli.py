@@ -104,7 +104,14 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     import pandas as pd
 
     from .eval.clustered import block_bootstrap, season_split
-    from .models.price import ComparablesPrice, HurdlePrice, build_auction_table, simulate_policy
+    from .models.price import (
+        FEATURE_COLUMNS,
+        OPPORTUNITY_COLUMNS,
+        ComparablesPrice,
+        HurdlePrice,
+        build_auction_table,
+        simulate_policy,
+    )
 
     paths = _paths(args.data)
     source = args.claims or paths["claims"]
@@ -124,48 +131,70 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
 
     target = train.price_to_beat
     baseline = ComparablesPrice().fit(train, target)
-    hurdle = HurdlePrice().fit(train, target)
-
     base_bids = baseline.predict(test)
     base = simulate_policy(test, base_bids)
 
-    # Policies are only comparable at a matched win rate: bidding more always wins
-    # more and costs more, so one axis has to be held fixed.
-    schedule = hurdle.bid_schedule(test)
-    matched = None
-    for confidence in np.arange(0.60, 0.99, 0.005):
-        result = simulate_policy(test, schedule.at(confidence))
-        gap = abs(result["contested_win_rate"] - base["contested_win_rate"])
-        if matched is None or gap < matched[0]:
-            matched = (gap, confidence, result)
-    _, confidence, best = matched
+    def matched_arm(features: tuple[str, ...]) -> tuple[float, dict, np.ndarray]:
+        """Fit a hurdle on ``features`` and find its bid at the baseline's win rate.
 
-    print(f"\n{'policy':28s} {'contested win%':>15s} {'mean bid':>10s}")
+        Policies are only comparable at a matched win rate: bidding more always
+        wins more and costs more, so one axis has to be held fixed. Matching on
+        *confidence* instead would compare two different operating points.
+        """
+        schedule = HurdlePrice(features=features).fit(train, target).bid_schedule(test)
+        best = None
+        for confidence in np.arange(0.60, 0.99, 0.005):
+            result = simulate_policy(test, schedule.at(confidence))
+            gap = abs(result["contested_win_rate"] - base["contested_win_rate"])
+            if best is None or gap < best[0]:
+                best = (gap, confidence, result)
+        _, confidence, result = best
+        return confidence, result, schedule.at(confidence)
+
+    without = tuple(c for c in FEATURE_COLUMNS if c not in OPPORTUNITY_COLUMNS)
+    arms = {"hurdle (box score only)": without} if args.ablate else {}
+    arms["hurdle (full)"] = FEATURE_COLUMNS
+
+    fitted = {name: matched_arm(features) for name, features in arms.items()}
+
+    print(f"\n{'policy':28s} {'contested win%':>15s} {'mean bid':>10s} {'vs baseline':>12s}")
     print(
         f"{'comparables (positional)':28s} {100 * base['contested_win_rate']:15.1f} "
-        f"{base['mean_bid']:10.4f}"
+        f"{base['mean_bid']:10.4f} {'--':>12s}"
     )
-    print(
-        f"{f'hurdle q={confidence:.3f}':28s} {100 * best['contested_win_rate']:15.1f} "
-        f"{best['mean_bid']:10.4f}"
-    )
-    print(
-        f"\nspend reduction at matched win rate: "
-        f"{100 * (1 - best['mean_bid'] / base['mean_bid']):.1f}%"
-    )
+    for name, (confidence, result, _) in fitted.items():
+        print(
+            f"{f'{name} q={confidence:.3f}':28s} {100 * result['contested_win_rate']:15.1f} "
+            f"{result['mean_bid']:10.4f} "
+            f"{100 * (1 - result['mean_bid'] / base['mean_bid']):11.1f}%"
+        )
 
     scored = test.copy()
     scored["baseline"] = base_bids
-    scored["hurdle"] = schedule.at(confidence)
+    for name, (_, _, bids) in fitted.items():
+        scored[name] = bids
 
-    def saving(frame: pd.DataFrame) -> float:
-        return (
-            simulate_policy(frame, frame.baseline.to_numpy())["mean_bid"]
-            - simulate_policy(frame, frame.hurdle.to_numpy())["mean_bid"]
+    def spend_gap(left: str, right: str):
+        def statistic(frame: pd.DataFrame) -> float:
+            return (
+                simulate_policy(frame, frame[left].to_numpy())["mean_bid"]
+                - simulate_policy(frame, frame[right].to_numpy())["mean_bid"]
+            )
+
+        return block_bootstrap(scored, statistic, draws=args.draws)
+
+    print(
+        f"\nbudget saved per auction vs baseline (franchise-clustered): "
+        f"{spend_gap('baseline', 'hurdle (full)')}"
+    )
+    if args.ablate:
+        # The Phase 1 question: do the opportunity features buy anything the box
+        # score did not already say? Positive means the full model bids less for
+        # the same wins. The interval is what decides it, not the point estimate.
+        print(
+            f"opportunity features, extra saving per auction: "
+            f"{spend_gap('hurdle (box score only)', 'hurdle (full)')}"
         )
-
-    estimate = block_bootstrap(scored, saving, draws=args.draws)
-    print(f"budget saved per auction (franchise-clustered): {estimate}")
     return 0
 
 
@@ -219,6 +248,11 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--train", default="2024")
     evaluate.add_argument("--test", default="2025")
     evaluate.add_argument("--draws", type=int, default=300, help="bootstrap resamples")
+    evaluate.add_argument(
+        "--ablate",
+        action="store_true",
+        help="also fit without the opportunity features, to price their contribution",
+    )
     evaluate.set_defaults(func=cmd_evaluate)
 
     status = subparsers.add_parser("status", help="show corpus and frontier state")

@@ -148,7 +148,7 @@ def _training_frame(n=400, seed=0, positions=("WR", "RB")):
             "depth_size": rng.integers(2, 7, n).astype(float),
             "depth_promotion": rng.integers(-1, 2, n).astype(float),
             "depth_is_starter": (rng.random(n) < 0.3).astype(float),
-            "demand_prior": rng.integers(0, 60, n).astype(float),
+            "demand_share": rng.random(n),
             "injury_severity": rng.integers(0, 4, n).astype(float),
         }
     ), pd.Series(price)
