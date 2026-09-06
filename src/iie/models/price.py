@@ -57,6 +57,16 @@ FEATURE_COLUMNS = (
     "reception_points",
     "waiver_budget",
     "is_defense",
+    # Opportunity shocks. depth_promotion and demand_prior are here because they
+    # move price hard while barely moving realized value -- a just-promoted starter
+    # costs 66% more and returns 26% less -- so a price model that cannot see them
+    # is blind to most of what the market is actually reacting to.
+    "depth_rank",
+    "depth_size",
+    "depth_promotion",
+    "depth_is_starter",
+    "demand_prior",
+    "injury_severity",
 )
 
 CATEGORICAL_COLUMNS = ("position",)

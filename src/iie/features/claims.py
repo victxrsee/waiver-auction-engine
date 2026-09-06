@@ -27,6 +27,7 @@ import pandas as pd
 
 from ..crawl.store import read_table
 from .asof import NflCalendar, attach_asof_week, check_no_lookahead
+from .opportunity import attach_opportunity
 from .panel import add_forward, add_trailing, build_player_week, on_full_week_grid
 
 log = logging.getLogger(__name__)
@@ -148,6 +149,10 @@ def build_claims(
     # The comparable price across leagues, and what a bid model should target.
     budget = merged["waiver_budget"].where(merged["waiver_budget"] > 0)
     merged["bid_pct"] = merged["waiver_bid"] / budget
+
+    # Depth chart, injury status and cross-league demand: the signals that precede
+    # a role change rather than describing it after the fact.
+    merged = attach_opportunity(merged, cache, seasons=seasons, calendar=calendar)
 
     # Read the week back from the *panel* side of the join rather than copying
     # asof_week. Copying it made the assertion compare a column to itself, so it
