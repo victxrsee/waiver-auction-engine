@@ -2,7 +2,7 @@
 
 Pricing FAAB waiver claims in fantasy football as what they actually are: **first-price sealed-bid auctions**.
 
-The engine learns what it costs to win a waiver claim from a corpus of 500 real
+The engine learns what it costs to win a waiver claim from a corpus of 2,280 real
 league-seasons, then recommends a bid. It is a working price model with a
 reproducible pipeline behind it; the value half — whether a player is *worth* the
 price — is not built yet.
@@ -33,7 +33,8 @@ directly.
 
 ## Results
 
-Trained on 2024, tested on 2025, with franchise-clustered intervals throughout.
+Trained on 2025 weeks 1–9 and tested on weeks 10+ — strictly past to future, on
+263k auctions in and 106k out, with franchise-clustered intervals throughout.
 
 Bidding policies cannot be compared head-to-head — bidding more always wins more
 and costs more — so they are compared on a **cost-effectiveness frontier**, at a
@@ -41,15 +42,27 @@ matched win rate:
 
 | policy | contested win rate | mean bid (share of budget) |
 | --- | --- | --- |
-| comparables baseline (positional mean) | 26.7% | 0.0246 |
-| hurdle model | 26.9% | **0.0191** |
+| comparables baseline (positional mean) | 18.3% | 0.0153 |
+| hurdle, box-score features | 18.3% | 0.0121 |
+| hurdle, + opportunity features | 18.2% | **0.0115** |
 
-**22.5% less budget spent for the same win rate.** Franchise-clustered saving of
-`+0.0055 [+0.0040, +0.0067]` of budget per auction. Supporting signal: Spearman
-0.305 `[0.288, 0.322]`, contested AUC 0.741.
+**24.7% less budget spent for the same win rate.** Franchise-clustered saving of
+`+0.0038 [+0.0034, +0.0041]` of budget per auction; the opportunity features
+(depth-chart movement, injury status, cross-league demand) account for
+`+0.0006 [+0.0005, +0.0007]` of it. Supporting signal: Spearman 0.172, contested
+AUC 0.673.
 
 The baseline is self-built (mean price by position and week bucket) — not a
 commercial product and not human managers.
+
+**On the split.** An earlier version trained on 2024 and tested on 2025, which
+looks like the more conventional choice and is in fact the weaker one here: the
+corpus is 91% 2025, so that split fits 22k auctions and scores 369k, across a
+season where nflverse changed the depth-chart schema outright. Measured under it,
+the opportunity features appear to *hurt* — entirely an artifact of the mismatch.
+Training on early weeks and predicting later ones keeps the train-on-the-past
+discipline and is closer to deployment anyway: you bid in week 10 knowing weeks
+1–9, never knowing only last season.
 
 ## Three problems worth reading the code for
 
@@ -111,12 +124,12 @@ The crawler is two-phase because the league graph explodes and roughly half of
 what it finds is unusable. The endpoint listing a user's leagues returns complete
 league objects, so **screening costs zero extra requests** and only survivors pay
 the ~18-request deep fetch. Fetch-then-filter over the same graph would have cost
-~75,000 requests; the crawl spent 9,144.
+~75,000 requests; the crawl spent ~25,000.
 
 ## Data
 
-500 league-seasons → 497 leagues → **428 franchises**, 2024–25, FAAB redraft only.
-212,767 transactions → **142,102 bid observations**.
+2,280 league-seasons → 1,997 leagues → **1,928 franchises**, 2024–25, FAAB redraft
+only. 882,767 transactions → **744,026 bid observations**.
 
 Only public, unauthenticated Sleeper endpoints are used. Identifying fields —
 display names, avatars, team names, league names — are **dropped at ingestion**;
@@ -130,21 +143,26 @@ deployed product.
 
 - **The value model is not built.** The engine prices claims but cannot yet say
   which are worth buying.
-- **Training is thin** — 2024 only, 174 franchises, tested on a different season.
+- **The corpus is 91% one season** — 1,824 leagues in 2025 against 175 in 2024, and
+  no 2024 leagues remain unfetched. Cross-season generalization is therefore
+  untested, and the 2024 depth-chart schema is not directly comparable to 2025's.
 - **Prices are conditional on a contest occurring.** A deployed engine faces the
   whole free-agent pool, most of whom nobody claims; that selection gap is open.
 - **Team defenses are unpriceable** — 12% of waiver activity. They key on team
   abbreviation and need team-level stats rather than a player join.
 - **Sampling is snowballed from one seed**, so it oversamples high-degree users.
   Measured: one manager's network is 30% of observations, which moves the headline
-  correlation by 0.005. Fine for modeling, not for population-level claims.
+  correlation by 0.005. Fine for modeling, not for population-level claims. The
+  crawler made this worse than it needed to be — it only expanded to new users when
+  its fetch queue ran dry, which never happened, so 2,280 leagues came from ~140
+  people. It now expands on a fixed cadence.
 - **The price target is noisy.** A quarter of contested auctions are exact ties
   broken by waiver priority, and in ~10% the winner bid less than a loser —
   almost certainly bids that could not be honoured for lack of budget.
 
 ## Tests
 
-168 tests, no network access required.
+202 tests, no network access required.
 
 ```bash
 .venv/bin/python -m pytest tests/ -q
