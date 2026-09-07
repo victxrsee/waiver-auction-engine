@@ -198,6 +198,44 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_audit(args: argparse.Namespace) -> int:
+    import pandas as pd
+
+    from .eval.audit import audit_features, format_report
+    from .models.price import CATEGORICAL_COLUMNS, FEATURE_COLUMNS
+
+    paths = _paths(args.data)
+    source = args.claims or paths["claims"]
+    if not Path(source).exists():
+        log.error("no claim table at %s; run `iie claims` first", source)
+        return 1
+
+    claims = pd.read_parquet(source)
+    # Auditing a feature across the boundary it defines reports the boundary.
+    ignore = ("week", "asof_week") if args.split == "week" else ()
+    if args.split == "week":
+        # The evaluation protocol splits 2025 on week, so that is the boundary the
+        # model must generalise over; auditing across seasons would miss a shift
+        # that happens inside one.
+        claims = claims[claims["season"] == args.season].copy()
+        claims["_split"] = ["weeks<=9" if w <= 9 else "weeks>9" for w in claims["week"]]
+        split_col = "_split"
+    else:
+        split_col = "season"
+
+    summary, findings = audit_features(
+        claims,
+        FEATURE_COLUMNS + CATEGORICAL_COLUMNS,
+        split_col=split_col,
+        categorical=CATEGORICAL_COLUMNS,
+        ignore=ignore,
+    )
+    print(f"\n{len(claims)} claims, split by {args.split}\n")
+    print(format_report(summary, findings, split_col))
+    # Nonzero exit so this can gate a rebuild in a script or a hook.
+    return 1 if findings else 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     from .crawl.frontier import Frontier
     from .crawl.store import SCHEMAS, read_table
@@ -254,6 +292,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="also fit without the opportunity features, to price their contribution",
     )
     evaluate.set_defaults(func=cmd_evaluate)
+
+    audit = subparsers.add_parser("audit", help="check features for silent join defects")
+    audit.add_argument("--claims", type=Path)
+    audit.add_argument(
+        "--split",
+        choices=("season", "week"),
+        default="week",
+        help="boundary to audit across; 'week' matches the evaluation protocol",
+    )
+    audit.add_argument("--season", default="2025", help="season to split on when --split=week")
+    audit.set_defaults(func=cmd_audit)
 
     status = subparsers.add_parser("status", help="show corpus and frontier state")
     status.add_argument("--claims", type=Path)
