@@ -315,6 +315,53 @@ def test_zero_previous_league_id_is_not_followed(wiring):
     assert client.calls.count("league") == 0
 
 
+def test_one_league_failing_mid_fetch_does_not_end_the_crawl(wiring):
+    """A league costs fourteen requests; a blip on any one used to kill the run.
+
+    An unattended crawl died this way after 56 leagues, on a read timeout partway
+    through one league's transactions.
+    """
+
+    class Flaky(FakeClient):
+        def get_league_transactions(self, league_id, week):
+            if league_id == "BAD":
+                raise RuntimeError("read timed out")
+            return super().get_league_transactions(league_id, week)
+
+    client = Flaky(
+        user_leagues={("uid-me", "2025"): [league("BAD"), league("GOOD")]},
+        rosters={"BAD": ACTIVE_ROSTERS, "GOOD": ACTIVE_ROSTERS},
+    )
+    crawler, store, frontier = wiring(client, CrawlPolicy(seasons=("2025",)))
+    crawler.seed_username("me")
+    report = crawler.run()
+    store.close()
+    assert report.leagues_fetched == 1, "the healthy league must still be fetched"
+    assert frontier.rejection_reasons().get("fetch_failed") == 1
+
+
+def test_a_sustained_outage_stops_rather_than_burning_the_frontier(wiring):
+    """Abandoning one league is resilience; abandoning every queued league during
+    an outage would empty the frontier with nothing to show for it."""
+
+    class Dead(FakeClient):
+        def get_league_transactions(self, league_id, week):
+            raise RuntimeError("connection refused")
+
+    client = Dead(
+        user_leagues={("uid-me", "2025"): [league(f"L{i}") for i in range(30)]},
+        rosters={f"L{i}": ACTIVE_ROSTERS for i in range(30)},
+    )
+    policy = CrawlPolicy(seasons=("2025",), max_consecutive_failures=3)
+    crawler, store, frontier = wiring(client, policy)
+    crawler.seed_username("me")
+    report = crawler.run()
+    store.close()
+    assert report.stopped_because == "network_unstable"
+    assert report.leagues_rejected == 3, "stops at the threshold, not after all 30"
+    assert frontier.counts()["leagues_accepted"] > 0, "the rest stay queued for a resume"
+
+
 def test_target_stops_the_crawl(wiring):
     client = FakeClient(
         user_leagues={("uid-me", "2025"): [league("A"), league("B"), league("C")]},

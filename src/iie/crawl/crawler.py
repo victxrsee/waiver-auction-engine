@@ -71,6 +71,9 @@ class CrawlPolicy:
     # user expansion every N fetches costs ~2 requests against the ~18 a league
     # costs, and buys the sample breadth the estimates depend on.
     expand_every: int = 8
+    # A run that cannot complete this many leagues in a row is not hitting bad
+    # leagues, it has lost the network. Stopping leaves the frontier resumable.
+    max_consecutive_failures: int = 10
     require_complete: bool = True
 
     def screen(self, raw: dict[str, Any]) -> tuple[bool, str]:
@@ -121,6 +124,9 @@ class Crawler:
         self._start_requests = self._requests_used()
         # Fetch count at the last forced expansion, so one cadence hit fires once.
         self._last_expansion = -1
+        # Tolerating one failed league is resilience; tolerating a hundred in a row
+        # is quietly burning the frontier during an outage.
+        self._consecutive_failures = 0
 
     def _requests_used(self) -> int:
         """Network fetches only. Cache hits are free and must not spend budget."""
@@ -257,6 +263,9 @@ class Crawler:
             if self.spent >= self.policy.max_requests:
                 self.report.stopped_because = "request_budget_exhausted"
                 break
+            if self._consecutive_failures >= self.policy.max_consecutive_failures:
+                self.report.stopped_because = "network_unstable"
+                break
 
             queued = self.frontier.counts()["leagues_accepted"]
             starving = queued < self.policy.low_water_mark
@@ -301,7 +310,20 @@ class Crawler:
         if not accepted:
             return False
         row = accepted[0]
-        self._fetch_league(row["league_id"], row["season"], row["depth"])
+        try:
+            self._fetch_league(row["league_id"], row["season"], row["depth"])
+        except Exception as exc:  # noqa: BLE001 - any transport failure, see below
+            # A league costs fourteen requests, so a blip on any one of them used to
+            # end an hour-long unattended crawl. The league is abandoned rather than
+            # requeued: its rosters and early weeks are already in the store, and a
+            # retry would duplicate them. Losing one league of two thousand is much
+            # cheaper than either duplicate rows or a dead crawl.
+            log.warning("league %s failed mid-fetch, abandoning: %s", row["league_id"], exc)
+            self.frontier.set_league_state(row["league_id"], "rejected", "fetch_failed")
+            self.report.leagues_rejected += 1
+            self._consecutive_failures += 1
+            return True
+        self._consecutive_failures = 0
         self._log_progress()
         return True
 
