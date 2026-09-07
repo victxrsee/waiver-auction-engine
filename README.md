@@ -42,18 +42,36 @@ matched win rate:
 
 | policy | contested win rate | mean bid (share of budget) |
 | --- | --- | --- |
-| comparables baseline (positional mean) | 18.3% | 0.0153 |
-| hurdle, box-score features | 18.3% | 0.0121 |
-| hurdle, + opportunity features | 18.2% | **0.0115** |
+| comparables baseline (positional mean) | 18.5% | 0.0154 |
+| hurdle, box-score features | 18.5% | 0.0127 |
+| hurdle, + opportunity features | 17.9% | **0.0120** |
 
-**24.7% less budget spent for the same win rate.** Franchise-clustered saving of
-`+0.0038 [+0.0034, +0.0041]` of budget per auction; the opportunity features
-(depth-chart movement, injury status, cross-league demand) account for
-`+0.0006 [+0.0005, +0.0007]` of it. Supporting signal: Spearman 0.172, contested
-AUC 0.673.
+**17–22% less budget spent for the same win rate**, depending on which population of
+leagues is measured. That range is the honest headline, and the spread inside it is
+the most interesting thing this project has measured about itself.
 
-The baseline is self-built (mean price by position and week bucket) — not a
-commercial product and not human managers.
+**Why it is a range.** The corpus was built by snowball sampling from one seed, and
+the crawler compounded that: it expanded to new users only when its fetch queue ran
+dry, which never happened, so 2,280 leagues came from ~140 people. Fixing that and
+re-crawling reached a materially different population:
+
+| cohort | leagues | contested auctions | mean price |
+| --- | --- | --- | --- |
+| original neighbourhood | 2,056 | 15.8% | 0.0132 |
+| after the breadth fix | 1,200 | **22.2%** | **0.0270** |
+
+Leagues outside the original neighbourhood are more competitive and pay **twice as
+much**. The opportunity features (depth-chart movement, injury status, cross-league
+demand) help in the first population and hurt in the second, so whether they are
+worth having is currently unresolved rather than settled either way.
+
+**A caution this corpus earns.** Measured on the two populations *pooled*, the model
+appears to save 47% — more than it saves in either population alone. That is not
+possible for a better model; it happens because the positional-mean baseline degrades
+badly when averaging two price regimes, so the gain measures the baseline getting
+worse. Spend reduction against a fitted baseline is not comparable across corpora,
+and any figure quoted from a differently-composed corpus should be re-derived rather
+than carried over.
 
 **On the split.** An earlier version trained on 2024 and tested on 2025, which
 looks like the more conventional choice and is in fact the weaker one here: the
