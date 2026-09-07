@@ -33,45 +33,45 @@ directly.
 
 ## Results
 
-Trained on 2025 weeks 1–9 and tested on weeks 10+ — strictly past to future, on
-263k auctions in and 106k out, with franchise-clustered intervals throughout.
+Trained on 2025 weeks 1–9 and tested on weeks 10+ — strictly past to future, with
+franchise-clustered intervals throughout.
 
-Bidding policies cannot be compared head-to-head — bidding more always wins more
-and costs more — so they are compared on a **cost-effectiveness frontier**, at a
-matched win rate:
+> **The headline is withdrawn pending re-derivation (2026-09-07).** Three independent
+> defects were found in one day, each sufficient on its own to invalidate the number
+> that stood here. They are documented below because how they were found is more
+> useful than the figure they replaced.
 
-| policy | contested win rate | mean bid (share of budget) |
-| --- | --- | --- |
-| comparables baseline (positional mean) | 18.5% | 0.0154 |
-| hurdle, box-score features | 18.5% | 0.0127 |
-| hurdle, + opportunity features | 17.9% | **0.0120** |
+**1. The depth-chart features read the future.** Each daily snapshot was labelled with
+the week that had *completed* when it was published, and a claim then joined the last
+snapshot carrying its `asof_week`. That label names a ~7-day bucket running from the
+end of week *W*'s games to the end of week *W+1*'s, and the claim sits at the near end
+of it. Measured across 707,398 joined rows: the snapshot a claim reads is published a
+median **5.0 days after that claim**, and is later than the claim **97.7%** of the
+time. Correcting it as-of drops `spearman(depth_rank, bid_pct)` from −0.061 to −0.025.
+The no-lookahead guard cannot see this — it compares week labels, which match by
+construction.
 
-**17–22% less budget spent for the same win rate**, depending on which population of
-leagues is measured. That range is the honest headline, and the spread inside it is
-the most interesting thing this project has measured about itself.
+**2. The corpus is 27% one account.** A single Sleeper user belongs to 877 of 3,256
+leagues, and those leagues are structurally unlike the rest: 27% of auctions contested
+against 16%, mean price 0.038 against 0.014, and a standardised $100 budget against a
+median of $131. They are public mass-entry leagues, not leagues among friends. Any
+statistic over the pooled corpus is a blend of two markets in a ratio set by one
+crawler decision.
 
-**Why it is a range.** The corpus was built by snowball sampling from one seed, and
-the crawler compounded that: it expanded to new users only when its fetch queue ran
-dry, which never happened, so 2,280 leagues came from ~140 people. Fixing that and
-re-crawling reached a materially different population:
+**3. The comparison metric is unstable at the operating point.** Policies are compared
+at a matched contested win rate, swept over a confidence grid. That curve is not
+smooth: between two adjacent grid points the mean bid moves 36% and the reported
+spend reduction moves from 42.9% to 22.2%, and one step further the win rate jumps
+8 points at once. Two runs over nearly identical data matched on opposite sides of a
+step and reported 17.3% and 46.9% for the same policy.
 
-| cohort | leagues | contested auctions | mean price |
-| --- | --- | --- | --- |
-| original neighbourhood | 2,056 | 15.8% | 0.0132 |
-| after the breadth fix | 1,200 | **22.2%** | **0.0270** |
+The pooled corpus also produces a spend reduction *larger than either population
+alone* — 47% pooled against 17% and 11% — which no better model can do. The
+positional-mean baseline degrades when averaging two price regimes, so that gain
+measures the baseline getting worse.
 
-Leagues outside the original neighbourhood are more competitive and pay **twice as
-much**. The opportunity features (depth-chart movement, injury status, cross-league
-demand) help in the first population and hurt in the second, so whether they are
-worth having is currently unresolved rather than settled either way.
-
-**A caution this corpus earns.** Measured on the two populations *pooled*, the model
-appears to save 47% — more than it saves in either population alone. That is not
-possible for a better model; it happens because the positional-mean baseline degrades
-badly when averaging two price regimes, so the gain measures the baseline getting
-worse. Spend reduction against a fitted baseline is not comparable across corpora,
-and any figure quoted from a differently-composed corpus should be re-derived rather
-than carried over.
+What survives: the pipeline, the auction framing, the target choice, and the
+defect-finding apparatus that produced this list. The number does not.
 
 **On the split.** An earlier version trained on 2024 and tested on 2025, which
 looks like the more conventional choice and is in fact the weaker one here: the
