@@ -12,11 +12,18 @@ join anything whose publication time is uncertain.
 
 nflverse publishes two incompatible schemas for this: 2025 onward is daily
 snapshots with a real timestamp, 2024 and earlier is weekly rows with no timestamp
-at all. Both are normalised to one row per player-week here. That forfeits the
-daily precision the newer format allows, deliberately -- a feature present only in
-the test season cannot be trained on, and differing granularity between train and
-test is itself a distribution shift. Concatenating the raw frames instead loses a
-whole season silently, which is what happened before the normalisers existed.
+at all. Concatenating the raw frames loses a whole season silently, which is what
+happened before the normalisers existed.
+
+**The timestamp is kept, and the join is made as of the claim itself.** An earlier
+version labelled each snapshot with the week that had completed when it was
+published and joined on that label. But such a label names a ~7-day bucket running
+from the end of week *W*'s games to the end of week *W+1*'s, and a claim sits at
+the *near* end of it -- so the snapshot a claim read was published a median 5.0
+days after it, and later than it 97.7% of the time. Timestamped charts are now
+joined with ``merge_asof`` on the claim's own instant. Untimestamped ones keep the
+week join, which is sound there because their label is the week the chart
+*describes* rather than a window it was published in.
 
 Measured on the corpus: this is where the mispricing lives. Controlling for current
 depth rank, a player promoted to first string within the week costs 66% more than
@@ -141,13 +148,15 @@ def _normalise_legacy_charts(charts: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_depth_charts(cache, seasons: list[int], calendar) -> pd.DataFrame:
-    """Depth charts normalised to one row per (player, season, week).
+    """Depth charts from both schemas, one row per observation, timestamps intact.
 
-    Week-level rather than per-snapshot, deliberately. The 2025 format carries daily
-    timestamps and the 2024 format does not, and a feature that exists only in the
-    test season cannot be trained on -- differing granularity between train and test
-    is itself a distribution shift. Both are reduced to the last chart known as of
-    each completed week, which is safely in the past for any claim at that boundary.
+    Every snapshot is kept rather than reduced to one per player-week. The reduction
+    is what caused the leak: it retained the *last* chart carrying a week label,
+    which sits at the far end of a window ending after the following week's games.
+    ``attach_depth_features`` picks the right one per claim instead, as of the claim.
+
+    ``dt`` is NaT for the 2024-and-earlier schema, which publishes no timestamp; those
+    rows are joined by week.
     """
     frames = []
     for season in seasons:
@@ -163,23 +172,30 @@ def build_depth_charts(cache, seasons: list[int], calendar) -> pd.DataFrame:
 
     frames = [f for f in frames if not f.empty]
     if not frames:
-        return _empty_charts().assign(depth_size=None)
+        return _empty_charts().assign(depth_size=None, dt=pd.NaT)
 
     charts = pd.concat(frames, ignore_index=True)
     charts = charts.dropna(subset=["season", "week"]).astype({"season": int, "week": int})
 
-    # Several snapshots can fall in one week; the latest is what a bidder saw.
-    charts = charts.sort_values("dt", na_position="first").drop_duplicates(
-        ["gsis_id", "season", "week"], keep="last"
-    )
+    # Snapshots are NOT collapsed to one row per player-week. Doing that used to
+    # keep the *last* snapshot carrying a week label -- but that label names a
+    # ~7-day bucket running from the end of week W's games to the end of week
+    # W+1's, so the kept snapshot sat at the far end of the window while the claim
+    # sat at the near end. Measured: the chart a claim read was published a median
+    # 5.0 days *after* it, and later than it 97.7% of the time. The timestamp is
+    # kept so the join can be made as-of the claim itself.
+    charts = charts.sort_values("dt", na_position="first")
 
     # How many players the club lists at this position, so a rank of 2 out of 2
-    # reads differently from 2 out of 6.
-    charts["depth_size"] = charts.groupby(["season", "week", "club", "pos_abb"])[
-        "pos_rank"
-    ].transform("size")
+    # reads differently from 2 out of 6. Scoped to one published chart, not to a
+    # week, or snapshots inside the week would be counted together.
+    charts["depth_size"] = charts.groupby(
+        ["season", "week", "club", "pos_abb", "dt"], dropna=False
+    )["pos_rank"].transform("size")
 
-    columns = ["gsis_id", "season", "week", "club", "pos_abb", "pos_rank", "depth_size"]
+    # "dt" is load-bearing: it is what lets the join be made as of the claim rather
+    # than as of a week label. NaT marks the untimestamped legacy schema.
+    columns = ["gsis_id", "season", "week", "club", "pos_abb", "pos_rank", "depth_size", "dt"]
     log.info(
         "depth charts: %d player-weeks across seasons %s",
         len(charts),
@@ -237,45 +253,131 @@ def build_injury_status(cache, seasons: list[int]) -> pd.DataFrame:
     )
 
 
+DEPTH_COLUMNS = ("depth_rank", "depth_size", "depth_promotion", "depth_is_starter")
+# How far back to look for the rank a promotion is measured against. A week, because
+# depth charts are published roughly weekly and the signal is "he moved up since the
+# last time anyone looked".
+PROMOTION_LOOKBACK = pd.Timedelta(days=7)
+
+
+def _asof_rank(
+    claims: pd.DataFrame, charts: pd.DataFrame, instants: pd.Series
+) -> pd.DataFrame:
+    """The last chart published at or before each instant, per player.
+
+    ``merge_asof`` on the raw timestamp rather than on a week label, because a week
+    label cannot express "before this Wednesday" -- it names a window that ends
+    after the following Sunday's games.
+    """
+    # merge_asof refuses to join datetime64[ms] against datetime64[us], and the two
+    # sides arrive at different resolutions: claim instants come from epoch
+    # milliseconds, chart timestamps from parsed strings. Pin both.
+    unit = "datetime64[us, UTC]"
+    left = pd.DataFrame(
+        {"gsis_id": claims["gsis_id"], "_at": pd.Series(instants).astype(unit)}
+    ).dropna(subset=["_at"])
+    left = left.sort_values("_at", kind="stable")
+    right = charts.assign(dt=charts["dt"].astype(unit)).sort_values("dt", kind="stable")
+    merged = pd.merge_asof(
+        left,
+        right[["dt", "gsis_id", "pos_rank", "depth_size"]],
+        left_on="_at",
+        right_on="dt",
+        by="gsis_id",
+        direction="backward",
+        allow_exact_matches=True,
+    )
+    merged.index = left.index
+    # The property a week-granularity guard cannot check. Cheap, and this is exactly
+    # the assertion whose absence let a five-day leak ship.
+    late = merged["dt"].notna() & (merged["dt"] > merged["_at"])
+    if late.any():
+        raise AssertionError(f"{late.sum()} depth charts joined from after the claim")
+    return merged.reindex(claims.index)
+
+
 def attach_depth_features(
-    claims: pd.DataFrame, charts: pd.DataFrame, *, asof_col: str = "asof_week"
+    claims: pd.DataFrame,
+    charts: pd.DataFrame,
+    *,
+    asof_col: str = "asof_week",
+    created_col: str = "created_ms",
 ) -> pd.DataFrame:
     """Depth position as of each claim, and how it changed in the preceding week.
 
-    Joined at ``asof_week`` -- the last week whose games had finished when the claim
-    was made -- and again at the week before it. The difference is the signal:
+    Two join paths, because the two nflverse schemas carry different time
+    information and forcing them through one convention is what caused the leak
+    this function was rewritten to fix.
+
+    * **Timestamped charts (2025 onward)** are joined ``merge_asof`` on the claim's
+      own instant: the last chart actually published when the bid was placed.
+    * **Untimestamped charts (2024 and earlier)** have no publication time, only a
+      game week, and are joined at ``asof_week`` -- the last week whose games had
+      finished. That is genuinely backward-looking, since the label is the week the
+      chart describes rather than a bucket it was published in.
+
     ``depth_promotion`` is positive when a player has moved up the chart, which is
-    what a role opening looks like *before* it shows up in a box score.
+    what a role opening looks like *before* it reaches a box score.
     """
-    columns = ("depth_rank", "depth_size", "depth_promotion", "depth_is_starter")
     out = claims.copy()
-    if charts.empty:
-        for column in columns:
+    if charts.empty or "dt" not in charts.columns:
+        for column in DEPTH_COLUMNS:
             out[column] = np.nan
         return out
 
-    out["_season_int"] = out["season"].astype(int)
-    keys = ["gsis_id", "_season_int", "_week"]
-    lookup = charts.rename(columns={"season": "_season_int", "week": "_week"})
+    # One row per player per observation. A player can be listed at two positions or
+    # for two clubs in the same week, and a left merge on a duplicated key fans out:
+    # the claim table silently grew by 48 rows before this existed. Best rank wins,
+    # matching what the legacy normaliser does across roles.
+    def _one_per(frame: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
+        if frame.empty:
+            return frame
+        return (
+            frame.sort_values("pos_rank")
+            .drop_duplicates(keys, keep="first")
+            .reset_index(drop=True)
+        )
 
-    def _rank_at(week_offset: int, name: str) -> pd.Series:
-        probe = out[["gsis_id", "_season_int", asof_col]].copy()
-        probe["_week"] = probe[asof_col] + week_offset
-        merged = probe.merge(
-            lookup[[*keys, "pos_rank", "depth_size"]], on=keys, how="left"
-        ).set_axis(out.index)
-        out[f"{name}_size"] = merged["depth_size"]
-        return merged["pos_rank"]
+    timestamped = _one_per(charts[charts["dt"].notna()], ["gsis_id", "dt"])
+    legacy = _one_per(charts[charts["dt"].isna()], ["gsis_id", "season", "week"])
 
-    out["depth_rank"] = _rank_at(0, "depth")
-    previous = _rank_at(-1, "_prev")
-    out = out.drop(columns=["_prev_size"])
+    rank = pd.Series(np.nan, index=out.index, dtype=float)
+    size = pd.Series(np.nan, index=out.index, dtype=float)
+    previous = pd.Series(np.nan, index=out.index, dtype=float)
 
+    if not timestamped.empty and created_col in out.columns:
+        instants = pd.to_datetime(out[created_col], unit="ms", utc=True)
+        now = _asof_rank(out, timestamped, instants)
+        before = _asof_rank(out, timestamped, instants - PROMOTION_LOOKBACK)
+        rank = rank.fillna(now["pos_rank"])
+        size = size.fillna(now["depth_size"])
+        previous = previous.fillna(before["pos_rank"])
+
+    if not legacy.empty:
+        probe = pd.DataFrame(
+            {"gsis_id": out["gsis_id"], "_s": out["season"].astype(int), "_w": out[asof_col]}
+        )
+        lookup = legacy.rename(columns={"season": "_s", "week": "_w"})
+        keys = ["gsis_id", "_s", "_w"]
+        for offset, target in ((0, "now"), (-1, "before")):
+            got = (
+                probe.assign(_w=probe["_w"] + offset)
+                .merge(lookup[[*keys, "pos_rank", "depth_size"]], on=keys, how="left")
+                .set_axis(out.index)
+            )
+            if target == "now":
+                rank = rank.fillna(got["pos_rank"])
+                size = size.fillna(got["depth_size"])
+            else:
+                previous = previous.fillna(got["pos_rank"])
+
+    out["depth_rank"] = rank
+    out["depth_size"] = size
     # Rank counts downward, so a fall in the rank number is a promotion.
-    out["depth_promotion"] = previous - out["depth_rank"]
-    out["depth_is_starter"] = (out["depth_rank"] == 1).astype(float)
-    out.loc[out["depth_rank"].isna(), "depth_is_starter"] = np.nan
-    return out.drop(columns="_season_int")
+    out["depth_promotion"] = previous - rank
+    out["depth_is_starter"] = (rank == 1).astype(float)
+    out.loc[rank.isna(), "depth_is_starter"] = np.nan
+    return out
 
 
 def attach_injury_features(

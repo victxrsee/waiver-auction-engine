@@ -362,6 +362,59 @@ def test_a_sustained_outage_stops_rather_than_burning_the_frontier(wiring):
     assert frontier.counts()["leagues_accepted"] > 0, "the rest stay queued for a resume"
 
 
+def test_one_account_cannot_dominate_the_corpus(wiring):
+    """A single Sleeper account belonging to 877 leagues supplied 27% of the real
+    corpus in one expansion, and its leagues are a different market -- public
+    mass-entry, 27% of auctions contested against 16%, three times the price. The
+    cap keeps one atypical account from setting the corpus mix."""
+    many = [league(f"L{i}") for i in range(40)]
+    client = FakeClient(
+        user_leagues={("uid-me", "2025"): many},
+        rosters={f"L{i}": ACTIVE_ROSTERS for i in range(40)},
+    )
+    policy = CrawlPolicy(seasons=("2025",), max_leagues_per_user=5, target_leagues=100)
+    crawler, store, _frontier = wiring(client, policy)
+    crawler.seed_username("me")
+    report = crawler.run()
+    store.close()
+    assert report.leagues_fetched == 5, "only the cap's worth may be taken"
+    assert report.leagues_capped == 35
+
+
+def test_the_cap_can_be_disabled(wiring):
+    many = [league(f"L{i}") for i in range(12)]
+    client = FakeClient(
+        user_leagues={("uid-me", "2025"): many},
+        rosters={f"L{i}": ACTIVE_ROSTERS for i in range(12)},
+    )
+    policy = CrawlPolicy(seasons=("2025",), max_leagues_per_user=0, target_leagues=100)
+    crawler, store, _frontier = wiring(client, policy)
+    crawler.seed_username("me")
+    report = crawler.run()
+    store.close()
+    assert report.leagues_fetched == 12
+    assert report.leagues_capped == 0
+
+
+def test_the_cap_counts_accepted_leagues_not_screened_ones(wiring):
+    """Rejected leagues cost nothing and tell us the neighbourhood is unsuitable;
+    counting them toward the cap would cut a walk short for free information."""
+    mixed = [league(f"OK{i}") for i in range(3)] + [
+        league(f"NO{i}", waiver_type=0) for i in range(10)
+    ]
+    client = FakeClient(
+        user_leagues={("uid-me", "2025"): mixed},
+        rosters={f"OK{i}": ACTIVE_ROSTERS for i in range(3)},
+    )
+    policy = CrawlPolicy(seasons=("2025",), max_leagues_per_user=3, target_leagues=100)
+    crawler, store, _frontier = wiring(client, policy)
+    crawler.seed_username("me")
+    report = crawler.run()
+    store.close()
+    assert report.leagues_fetched == 3
+    assert report.leagues_rejected == 10, "rejections must not consume the cap"
+
+
 def test_target_stops_the_crawl(wiring):
     client = FakeClient(
         user_leagues={("uid-me", "2025"): [league("A"), league("B"), league("C")]},

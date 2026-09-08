@@ -74,6 +74,10 @@ class CrawlPolicy:
     # A run that cannot complete this many leagues in a row is not hitting bad
     # leagues, it has lost the network. Stopping leaves the frontier resumable.
     max_consecutive_failures: int = 10
+    # Ceiling on accepted leagues from any one person. See _expand_user: an account
+    # in 877 leagues supplied 27% of the corpus, and its leagues are a different
+    # market. 0 disables the cap.
+    max_leagues_per_user: int = 25
     require_complete: bool = True
 
     def screen(self, raw: dict[str, Any]) -> tuple[bool, str]:
@@ -103,6 +107,7 @@ class CrawlReport:
     leagues_screened: int = 0
     leagues_fetched: int = 0
     leagues_rejected: int = 0
+    leagues_capped: int = 0
     stopped_because: str = "unfinished"
     rejection_reasons: dict[str, int] = field(default_factory=dict)
     frontier_counts: dict[str, int] = field(default_factory=dict)
@@ -155,7 +160,16 @@ class Crawler:
     # --- steps ------------------------------------------------------------
 
     def _expand_user(self, user_id: str, depth: int) -> None:
-        """List a user's leagues for every season and screen them in place."""
+        """List a user's leagues for every season and screen them in place.
+
+        At most ``max_leagues_per_user`` are accepted from any one person. One
+        account belonging to 877 leagues supplied 27% of the whole corpus in a
+        single expansion, and those leagues were not like the rest -- public
+        mass-entry leagues, 27% of auctions contested against 16% and three times
+        the price. Without a cap, one atypical account sets the mix of the corpus
+        and every pooled statistic blends two markets in a ratio nobody chose.
+        """
+        taken = 0
         for season in self.policy.seasons:
             for raw in self.client.get_user_leagues(user_id, season):
                 league_id = raw.get("league_id")
@@ -163,6 +177,15 @@ class Crawler:
                     continue
 
                 accepted, reason = self.policy.screen(raw)
+                # Screening first, and capping only acceptances, for two reasons: a
+                # rejection is free information about the neighbourhood and should
+                # still be recorded, and a league skipped here is left *undiscovered*
+                # rather than marked rejected -- so if a second, more typical member
+                # of it turns up later, the walk can still take it from them.
+                cap = self.policy.max_leagues_per_user
+                if accepted and cap and taken >= cap:
+                    self.report.leagues_capped += 1
+                    continue
                 self.frontier.add_league(
                     league_id,
                     str(raw.get("season") or season),
@@ -172,6 +195,7 @@ class Crawler:
                 )
                 self.report.leagues_screened += 1
                 if accepted:
+                    taken += 1
                     self.store.add_league(raw)
                     # A league chains backward a season at a time, and history is
                     # what the realized-outcome model trains on.

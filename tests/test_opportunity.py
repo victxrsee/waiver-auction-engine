@@ -109,11 +109,14 @@ def test_no_seasons_at_all_returns_a_usable_empty_frame():
     assert "pos_rank" in charts.columns, "callers index this frame even when it is empty"
 
 
-def test_only_the_latest_chart_in_a_week_is_kept():
-    """Several snapshots can land in one week; a bidder saw the last of them."""
+def test_every_snapshot_is_kept_not_just_the_last_in_a_week():
+    """Collapsing to one row per player-week is what caused the five-day leak: the
+    kept snapshot sat at the far end of the week bucket while the claim sat at the
+    near end. The join needs every snapshot so it can pick the right one."""
     same_week = MODERN.assign(dt=pd.to_datetime(["2025-09-10"] * 2 + ["2025-09-11"] * 2, utc=True))
     charts = build_depth_charts(FakeCache({2025: same_week}), [2025], FakeCalendar())
-    assert len(charts) == 2, "one row per player-week"
+    assert len(charts) == 4, "both snapshots must survive"
+    assert charts["dt"].notna().all()
 
 
 # --- depth features ---------------------------------------------------------
@@ -128,6 +131,8 @@ CHARTS = pd.DataFrame(
         "pos_abb": ["RB"] * 3,
         "pos_rank": [3.0, 1.0, 2.0],
         "depth_size": [4.0, 4.0, 4.0],
+        # No publication timestamp: the 2024-and-earlier schema, joined by week.
+        "dt": [pd.NaT] * 3,
     }
 )
 
@@ -182,6 +187,80 @@ def test_row_order_is_preserved():
 def test_empty_charts_still_produce_the_columns():
     out = attach_depth_features(CLAIMS, pd.DataFrame())
     assert out["depth_rank"].isna().all()
+
+
+# --- as-of joining, the leak this module was rewritten to fix ----------------
+
+# A Wednesday claim, with charts published on either side of it.
+CLAIM_AT = pd.Timestamp("2025-10-08 12:00", tz="UTC")
+TIMESTAMPED = pd.DataFrame(
+    {
+        "gsis_id": ["p1", "p1", "p1"],
+        "season": [2025] * 3,
+        "week": [5, 5, 5],
+        "club": ["SF"] * 3,
+        "pos_abb": ["RB"] * 3,
+        "pos_rank": [3.0, 2.0, 1.0],
+        "depth_size": [4.0, 4.0, 4.0],
+        "dt": pd.to_datetime(
+            ["2025-09-29 12:00", "2025-10-06 12:00", "2025-10-12 12:00"], utc=True
+        ),
+    }
+)
+TIMED_CLAIM = pd.DataFrame(
+    {
+        "gsis_id": ["p1"],
+        "season": ["2025"],
+        "asof_week": [5],
+        "week": [6],
+        "player_id": ["a"],
+        "league_id": ["L1"],
+        "created_ms": [int(CLAIM_AT.timestamp() * 1000)],
+    }
+)
+
+
+def test_a_chart_published_after_the_claim_is_never_used():
+    """The defect: labelling a snapshot with its completed week meant a claim read
+    the *last* chart in a ~7-day bucket ending after the following Sunday's games.
+    Measured on the corpus, 97.7% of depth features came from a chart published
+    after the claim that read it, a median of 5.0 days later."""
+    out = attach_depth_features(TIMED_CLAIM, TIMESTAMPED)
+    # Oct 6 is the last chart at or before the Oct 8 claim; Oct 12 is the future.
+    assert out["depth_rank"].iloc[0] == 2.0
+
+
+def test_promotion_is_measured_against_a_week_earlier_by_clock_not_by_label():
+    """Sep 29 (rank 3) is the chart a week before the claim; Oct 6 is rank 2."""
+    out = attach_depth_features(TIMED_CLAIM, TIMESTAMPED)
+    assert out["depth_promotion"].iloc[0] == 1.0
+
+
+def test_a_claim_before_any_chart_gets_nulls():
+    early = TIMED_CLAIM.assign(
+        created_ms=[int(pd.Timestamp("2025-09-01", tz="UTC").timestamp() * 1000)]
+    )
+    out = attach_depth_features(early, TIMESTAMPED)
+    assert pd.isna(out["depth_rank"].iloc[0])
+
+
+def test_both_schemas_can_be_joined_in_one_call():
+    """2024 rows have no timestamp and 2025 rows do; each must take its own path."""
+    charts = pd.concat([CHARTS.assign(season=2024), TIMESTAMPED], ignore_index=True)
+    claims = pd.concat([CLAIMS.assign(season="2024").head(1), TIMED_CLAIM], ignore_index=True)
+    out = attach_depth_features(claims, charts)
+    assert out["depth_rank"].notna().all(), "neither path may come back empty"
+
+
+def test_an_out_of_order_claim_frame_still_joins_as_of():
+    """merge_asof requires sorted keys; the claim table is not sorted by time."""
+    shuffled = pd.concat([TIMED_CLAIM] * 3, ignore_index=True)
+    shuffled["created_ms"] = [
+        int(pd.Timestamp(t, tz="UTC").timestamp() * 1000)
+        for t in ("2025-10-08", "2025-09-30", "2025-10-13")
+    ]
+    out = attach_depth_features(shuffled, TIMESTAMPED)
+    assert list(out["depth_rank"]) == [2.0, 3.0, 1.0]
 
 
 # --- injuries ---------------------------------------------------------------

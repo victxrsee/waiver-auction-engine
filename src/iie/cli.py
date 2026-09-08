@@ -100,7 +100,6 @@ def cmd_claims(args: argparse.Namespace) -> int:
 
 
 def cmd_evaluate(args: argparse.Namespace) -> int:
-    import numpy as np
     import pandas as pd
 
     from .eval.clustered import block_bootstrap, season_split
@@ -110,7 +109,9 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         ComparablesPrice,
         HurdlePrice,
         build_auction_table,
+        policy_frontier,
         simulate_policy,
+        spend_at_win_rate,
     )
 
     paths = _paths(args.data)
@@ -120,7 +121,19 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         return 1
 
     auctions = build_auction_table(pd.read_parquet(source))
-    train, test = season_split(auctions, _seasons(args.train), _seasons(args.test))
+    if args.protocol == "week":
+        # The protocol CLAUDE.md mandates, and the one the CLI could not previously
+        # run: train on the early weeks of a season and predict its later ones. It
+        # keeps train-on-the-past without spanning a season's schema change, and is
+        # closer to deployment -- you bid in week 10 knowing weeks 1-9.
+        one = auctions[auctions["season"] == args.season]
+        train = one[one["week"] <= args.cut]
+        test = one[one["week"] > args.cut]
+    else:
+        train, test = season_split(auctions, _seasons(args.train), _seasons(args.test))
+    if train.empty or test.empty:
+        log.error("empty split: check --protocol/--season/--cut against the corpus")
+        return 1
     log.info(
         "train %d auctions (%d franchises) | test %d (%d)",
         len(train),
@@ -134,45 +147,60 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     base_bids = baseline.predict(test)
     base = simulate_policy(test, base_bids)
 
-    def matched_arm(features: tuple[str, ...]) -> tuple[float, dict, np.ndarray]:
-        """Fit a hurdle on ``features`` and find its bid at the baseline's win rate.
-
-        Policies are only comparable at a matched win rate: bidding more always
-        wins more and costs more, so one axis has to be held fixed. Matching on
-        *confidence* instead would compare two different operating points.
-        """
-        schedule = HurdlePrice(features=features).fit(train, target).bid_schedule(test)
-        best = None
-        for confidence in np.arange(0.60, 0.99, 0.005):
-            result = simulate_policy(test, schedule.at(confidence))
-            gap = abs(result["contested_win_rate"] - base["contested_win_rate"])
-            if best is None or gap < best[0]:
-                best = (gap, confidence, result)
-        _, confidence, result = best
-        return confidence, result, schedule.at(confidence)
-
     without = tuple(c for c in FEATURE_COLUMNS if c not in OPPORTUNITY_COLUMNS)
     arms = {"hurdle (box score only)": without} if args.ablate else {}
     arms["hurdle (full)"] = FEATURE_COLUMNS
 
-    fitted = {name: matched_arm(features) for name, features in arms.items()}
+    # Every arm is read off its own frontier at one common win rate -- the
+    # baseline's. Snapping each arm to its nearest grid confidence instead landed
+    # them at *different* win rates (27.37% against 27.90%) and then differenced
+    # them, charging the gap in operating point to the model.
+    goal = base["contested_win_rate"]
+    fitted = {}
+    for name, features in arms.items():
+        schedule = HurdlePrice(features=features).fit(train, target).bid_schedule(test)
+        curve = policy_frontier(test, schedule)
+        fitted[name] = (curve, spend_at_win_rate(curve, goal), schedule)
 
-    print(f"\n{'policy':28s} {'contested win%':>15s} {'mean bid':>10s} {'vs baseline':>12s}")
-    print(
-        f"{'comparables (positional)':28s} {100 * base['contested_win_rate']:15.1f} "
-        f"{base['mean_bid']:10.4f} {'--':>12s}"
-    )
-    for name, (confidence, result, _) in fitted.items():
+    print(f"\nall policies read at a contested win rate of {100 * goal:.2f}%\n")
+    print(f"{'policy':28s} {'mean bid':>10s} {'vs baseline':>12s} {'bracket':>10s}")
+    print(f"{'comparables (positional)':28s} {base['mean_bid']:10.4f} {'--':>12s} {'--':>10s}")
+    for name, (_, point, _) in fitted.items():
+        flag = " *" if point["step"] > 0.1 * base["mean_bid"] else ""
         print(
-            f"{f'{name} q={confidence:.3f}':28s} {100 * result['contested_win_rate']:15.1f} "
-            f"{result['mean_bid']:10.4f} "
-            f"{100 * (1 - result['mean_bid'] / base['mean_bid']):11.1f}%"
+            f"{name:28s} {point['spend']:10.4f} "
+            f"{100 * (1 - point['spend'] / base['mean_bid']):11.1f}% "
+            f"{point['step']:10.4f}{flag}"
         )
 
+    # The bracket is how far the spend moves between the two grid points the
+    # interpolation sits between. A wide one means the figure is fragile no matter
+    # how it was derived, so it is printed rather than hidden behind the estimate.
+    if any(p["step"] > 0.1 * base["mean_bid"] for _, p, _ in fitted.values()):
+        print(
+            "\n* the frontier steps by more than 10% of the baseline bid here; "
+            "treat the figure as indicative and read the frontier with --frontier"
+        )
+    if any(p.get("extrapolated") for _, p, _ in fitted.values()):
+        print("\nWARNING: a policy never reaches that win rate; its spend is extrapolated")
+
+    if args.frontier:
+        for name, (curve, _, _) in fitted.items():
+            print(f"\n{name} frontier:")
+            print(f"{'q':>7s} {'contested win%':>15s} {'mean bid':>10s}")
+            for row in curve.itertuples():
+                print(
+                    f"{row.confidence:7.3f} {100 * row.contested_win_rate:15.2f} "
+                    f"{row.mean_bid:10.4f}"
+                )
+
+    # Clustered intervals are taken on bids realised at the common win rate, so the
+    # bootstrap resamples the same policies the table above reports.
     scored = test.copy()
     scored["baseline"] = base_bids
-    for name, (_, _, bids) in fitted.items():
-        scored[name] = bids
+    for name, (curve, point, schedule) in fitted.items():
+        nearest = curve.iloc[(curve["contested_win_rate"] - goal).abs().argmin()]
+        scored[name] = schedule.at(float(nearest["confidence"]))
 
     def spend_gap(left: str, right: str):
         def statistic(frame: pd.DataFrame) -> float:
@@ -283,9 +311,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     evaluate = subparsers.add_parser("evaluate", help="train and score the price model")
     evaluate.add_argument("--claims", type=Path)
+    evaluate.add_argument(
+        "--protocol",
+        choices=("week", "season"),
+        default="week",
+        help="'week' trains on early weeks of one season (the mandated protocol)",
+    )
+    evaluate.add_argument("--season", default="2025", help="season to split when --protocol=week")
+    evaluate.add_argument("--cut", type=int, default=9, help="last training week")
     evaluate.add_argument("--train", default="2024")
     evaluate.add_argument("--test", default="2025")
     evaluate.add_argument("--draws", type=int, default=300, help="bootstrap resamples")
+    evaluate.add_argument(
+        "--frontier", action="store_true", help="print the full win-rate/spend curve per arm"
+    )
     evaluate.add_argument(
         "--ablate",
         action="store_true",

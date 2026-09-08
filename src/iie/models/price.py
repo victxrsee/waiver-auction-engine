@@ -376,6 +376,64 @@ def simulate_policy(
     }
 
 
+DEFAULT_CONFIDENCES = np.round(np.arange(0.50, 0.99, 0.005), 4)
+
+
+def policy_frontier(
+    auctions: pd.DataFrame, schedule: BidSchedule, confidences: np.ndarray | None = None
+) -> pd.DataFrame:
+    """Win rate and spend at every operating point, which is the real comparison.
+
+    A single matched point is not enough, because this curve is not smooth. The
+    needed conditional quantile is ``1 - (1-q)/p``, and as ``q`` rises it crosses
+    the coarse grid the quantile regressions were fitted on, so the interpolated
+    bid jumps. Measured on the corpus: between two adjacent confidences the mean bid
+    moved 36% and the reported spend reduction moved from 42.9% to 22.2%, and one
+    step further the contested win rate jumped eight points at once. Two runs over
+    near-identical data landed on opposite sides of a step and reported 17.3% and
+    46.9% for the same policy.
+    """
+    grid = DEFAULT_CONFIDENCES if confidences is None else np.asarray(confidences)
+    rows = [{"confidence": float(c), **simulate_policy(auctions, schedule.at(c))} for c in grid]
+    return pd.DataFrame(rows).sort_values("contested_win_rate").reset_index(drop=True)
+
+
+def spend_at_win_rate(
+    frontier: pd.DataFrame,
+    target: float,
+    *,
+    win_col: str = "contested_win_rate",
+    spend_col: str = "mean_bid",
+) -> dict[str, float]:
+    """Spend interpolated onto an exact win rate, with the local step size.
+
+    Snapping to the nearest grid confidence lands two arms at different win rates
+    and then differences them, which charges the gap to the model. Interpolating
+    onto a common win rate is the minimum fix; ``step`` reports how far apart the
+    bracketing points were, because a wide bracket means the number is fragile
+    however it was obtained.
+    """
+    usable = frontier.dropna(subset=[win_col, spend_col]).sort_values(win_col)
+    wins = usable[win_col].to_numpy(dtype=float)
+    spend = usable[spend_col].to_numpy(dtype=float)
+    if len(wins) == 0:
+        return {"spend": float("nan"), "win_rate": float(target), "step": float("nan")}
+
+    value = float(np.interp(target, wins, spend))
+    index = int(np.searchsorted(wins, target))
+    low = max(index - 1, 0)
+    high = min(index, len(wins) - 1)
+    # How much the spend varies across the bracket the answer was drawn from.
+    step = abs(spend[high] - spend[low])
+    inside = wins[0] <= target <= wins[-1]
+    return {
+        "spend": value,
+        "win_rate": float(target),
+        "step": step,
+        "extrapolated": float(not inside),
+    }
+
+
 def evaluate(predictions: np.ndarray, truth: pd.Series) -> dict[str, float]:
     """Error and ranking quality.
 
