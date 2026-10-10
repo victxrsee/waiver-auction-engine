@@ -415,6 +415,35 @@ def test_the_cap_counts_accepted_leagues_not_screened_ones(wiring):
     assert report.leagues_rejected == 10, "rejections must not consume the cap"
 
 
+def test_a_live_season_does_not_pay_for_weeks_that_cannot_exist(wiring):
+    """A 2026 crawl at week 5 spent 6,300 of 13,108 requests -- 48% of the run -- on
+    transaction weeks 6-14, every one of which returned nothing. Sleeper reports the
+    current week as `settings.leg`, so the ceiling is knowable for free."""
+    client = FakeClient(
+        user_leagues={("uid-me", "2025"): [league("LIVE")]},
+        rosters={"LIVE": ACTIVE_ROSTERS},
+    )
+    policy = CrawlPolicy(seasons=("2025",), max_transaction_week=5)
+    crawler, store, _frontier = wiring(client, policy)
+    crawler.seed_username("me")
+    crawler.run()
+    store.close()
+    assert client.calls.count("transactions") == 5, "weeks 6-14 must not be requested"
+
+
+def test_the_full_week_range_is_fetched_by_default(wiring):
+    """A finished season has data in every week, so the ceiling must be opt-in."""
+    client = FakeClient(
+        user_leagues={("uid-me", "2025"): [league("DONE")]},
+        rosters={"DONE": ACTIVE_ROSTERS},
+    )
+    crawler, store, _frontier = wiring(client, CrawlPolicy(seasons=("2025",)))
+    crawler.seed_username("me")
+    crawler.run()
+    store.close()
+    assert client.calls.count("transactions") == 14
+
+
 def test_target_stops_the_crawl(wiring):
     client = FakeClient(
         user_leagues={("uid-me", "2025"): [league("A"), league("B"), league("C")]},

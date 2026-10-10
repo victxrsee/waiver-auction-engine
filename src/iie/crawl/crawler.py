@@ -59,6 +59,13 @@ class CrawlPolicy:
     min_budget_used: int = 50
     # Weeks 15-17 are fantasy playoffs: little waiver activity, ~18% of the cost.
     transaction_weeks: tuple[int, ...] = tuple(range(1, 15))
+    # Ceiling on the weeks fetched, for a season that has not finished yet. A live
+    # season's later weeks cannot have transactions, but every fetched league paid
+    # for them anyway: a 2026 crawl at week 5 spent 6,300 of 13,108 requests -- 48%
+    # of the run -- on weeks 6-14, which returned nothing at all. Sleeper reports
+    # the current week as `settings.leg`, so the operator can read it off and pass
+    # it. None means fetch the full range.
+    max_transaction_week: int | None = None
 
     expand_through_rejected: bool = False
     # Keep enough accepted leagues queued that fetching never starves.
@@ -253,7 +260,10 @@ class Crawler:
             # a season nor a missing value downstream.
             log.warning("league %s has no season; its rows will not be joinable", league_id)
             season = None
-        for week in self.policy.transaction_weeks:
+        weeks = self.policy.transaction_weeks
+        if self.policy.max_transaction_week is not None:
+            weeks = tuple(w for w in weeks if w <= self.policy.max_transaction_week)
+        for week in weeks:
             transactions = self.client.get_league_transactions(league_id, week)
             if transactions:
                 self.store.add_transactions(league_id, season, week, transactions)

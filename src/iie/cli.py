@@ -58,6 +58,7 @@ def cmd_crawl(args: argparse.Namespace) -> int:
         # (and therefore V) are truncated.
         require_complete=not args.include_incomplete,
         expand_every=args.expand_every,
+        max_transaction_week=args.max_week,
     )
 
     with Frontier(paths["frontier"]) as frontier, CorpusStore(paths["corpus"]) as store:
@@ -68,11 +69,17 @@ def cmd_crawl(args: argparse.Namespace) -> int:
 
     log.info("stopped: %s after %d requests", report.stopped_because, report.requests)
     log.info(
-        "fetched %d leagues, rejected %d (%s)",
+        "this run: fetched %d leagues, rejected %d, capped %d, expanded %d users",
         report.leagues_fetched,
         report.leagues_rejected,
-        report.rejection_reasons,
+        # Previously never printed anywhere, so there was no way to tell whether the
+        # per-user cap had bound or how often.
+        report.leagues_capped,
+        report.users_expanded,
     )
+    # Cumulative over the whole frontier, not this run -- which is why these sum to
+    # more than the per-run rejection count above.
+    log.info("frontier rejection reasons (all runs): %s", report.rejection_reasons)
     return 0
 
 
@@ -388,6 +395,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--include-incomplete",
         action="store_true",
         help="accept leagues whose season is still running (required for a live season)",
+    )
+    crawl.add_argument(
+        "--max-week",
+        type=int,
+        help="skip transaction weeks above this; set it to a live season's current "
+        "week (Sleeper's settings.leg) to avoid paying for weeks that cannot exist",
     )
     crawl.add_argument(
         "--expand-every",
