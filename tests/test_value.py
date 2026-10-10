@@ -95,11 +95,23 @@ def test_the_final_week_has_no_future_and_says_so():
     assert (last["fantasy_points_next6"] == 0).all()
 
 
-def test_weeks_remaining_is_deterministic_from_the_calendar():
-    """It carries no outcome information beyond the length of the window, which is
-    why it is a legitimate feature rather than a leak."""
+def test_weeks_remaining_is_the_window_length_not_the_weeks_left():
+    """`18 - week` is a strictly decreasing function of `week`, which is already a
+    feature, so it told a tree ensemble nothing: the two measured at correlation
+    -1.000 and an arm given both scored bit-identically to an arm given one. It was
+    also plainly wrong as described, claiming a 17-week window at week 1.
+
+    Clipping at the horizon is what makes it informative -- flat where the window is
+    full, falling only where it truly truncates, which `week` cannot express.
+    """
     frame = ready(n_players=2)
-    assert (frame["weeks_remaining"] == (18 - frame["week"]).clip(lower=0)).all()
+    expected = (18 - frame["week"]).clip(lower=0, upper=6)
+    assert (frame["weeks_remaining"] == expected).all()
+    assert (frame.loc[frame.week <= 12, "weeks_remaining"] == 6).all(), "flat while full"
+    assert frame.loc[frame.week == 16, "weeks_remaining"].iat[0] == 2
+    # Not a monotone transform of week, which is the whole point.
+    early = frame[frame.week.between(1, 12)]
+    assert early["weeks_remaining"].nunique() == 1 and early["week"].nunique() == 12
 
 
 def test_no_forward_column_is_a_feature():

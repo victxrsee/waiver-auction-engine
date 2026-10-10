@@ -110,6 +110,25 @@ def on_full_week_grid(panel: pd.DataFrame, max_week: int = MAX_WEEK) -> pd.DataF
         if column in full.columns:
             full[column] = full[column].fillna(0.0)
 
+    # Volume is zero on a week a player did not appear, but his *position* is not
+    # missing -- it is simply not restated on a row the stat feed never wrote. Left
+    # unfilled it was null on 49% of panel rows, exactly where `played == 0`, which
+    # is the population a waiver engine exists to price: the backup who sat last
+    # week. Downstream that silently became 14% of non-defense claims reaching the
+    # price model with its only categorical feature missing, and sent half the value
+    # model's baseline to a global mean. A position does not change within a season,
+    # so the player's own most common one is the right fill.
+    if "position" in full.columns:
+        modal = (
+            full.dropna(subset=["position"])
+            .groupby(["gsis_id", "season"])["position"]
+            .agg(lambda s: s.mode().iat[0] if not s.mode().empty else None)
+            .rename("_modal_position")
+        )
+        full = full.merge(modal, on=["gsis_id", "season"], how="left")
+        full["position"] = full["position"].fillna(full["_modal_position"])
+        full = full.drop(columns="_modal_position")
+
     return (
         full.drop(columns="_present")
         .sort_values(["gsis_id", "season", "week"])

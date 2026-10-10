@@ -266,13 +266,31 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
 def cmd_value(args: argparse.Namespace) -> int:
     """Train and score the value model on the nflverse player panel.
 
+    Split by **season**, not by week as `iie evaluate` does. The six-week forward
+    window would straddle a within-season week cut, putting the test period's
+    outcomes into training targets -- so the protocol that is mandated for the price
+    model is a leak here. Do not switch this to `--protocol week`.
+
     Deliberately independent of the crawled corpus: outcomes exist for every
     player-week whether or not anyone bid, so training here avoids conditioning on
     somebody having already wanted the player -- which is the selection the engine
     exists to second-guess.
     """
-    from .features.panel import add_forward, add_trailing, build_player_week, on_full_week_grid
-    from .models.value import PositionalValue, ValueModel, add_horizon, evaluate_value
+    import numpy as np
+
+    from .features.panel import (
+        add_forward,
+        add_trailing,
+        build_player_week,
+        on_full_week_grid,
+    )
+    from .models.value import (
+        PositionalValue,
+        TrailingProduction,
+        ValueModel,
+        add_horizon,
+        evaluate_value,
+    )
     from .sources.nflverse import NflverseCache
 
     cache = NflverseCache(_paths(args.data)["nflverse"])
@@ -295,21 +313,35 @@ def cmd_value(args: argparse.Namespace) -> int:
         + args.reception_points * test[f"receptions_next{args.horizon}"]
     )
     arms = {
-        "positional baseline": PositionalValue(),
+        "constant zero": None,
+        "positional mean": PositionalValue(),
+        "trailing production": TrailingProduction(),
         "value model": ValueModel(horizon=args.horizon),
     }
-    print(f"\n{'model':22s} {'MAE':>8s} {'RMSE':>8s} {'Spearman':>10s} {'within-week':>12s}")
+    # Ordered worst-metric-first on purpose. within-week Spearman leads because it is
+    # the decision: which claim to make from the set available this week. MAE is
+    # reported last and only for reference -- CLAUDE.md invariant 6 forbids ranking on
+    # it, and the target is ~80% zeros, so "constant zero" beats a real baseline on
+    # it while being useless. Read down the Spearman column, not the MAE one.
+    print(f"\n{'model':22s} {'within-week rho':>16s} {'RMSE':>9s} {'MAE (do not rank)':>19s}")
+    scoreable = 0
     for name, model in arms.items():
-        predicted = model.fit(train).predict_points(test, args.reception_points)
+        if model is None:
+            predicted = np.zeros(len(test))
+        else:
+            predicted = model.fit(train).predict_points(test, args.reception_points)
         got = evaluate_value(predicted, truth, groups=test["week"])
-        print(
-            f"{name:22s} {got['mae']:8.2f} {got['rmse']:8.2f} "
-            f"{got['spearman']:10.3f} {got['spearman_within_group']:12.3f}"
-        )
-    # Within-week ranking is the number that matters: the decision is which claim to
-    # make from the set available this week, so order inside a week beats level.
-    print("\nwithin-week Spearman is the decision-relevant figure; pooled is flattered")
-    print("by contrasts between early and late weeks that no manager ever faces.")
+        rho = got["spearman_within_group"]
+        shown = "   n/a (constant)" if np.isnan(rho) else f"{rho:16.3f}"
+        print(f"{name:22s} {shown} {got['rmse']:9.2f} {got['mae']:19.2f}")
+        scoreable = max(scoreable, int(got["groups_ranked"]))
+
+    print(
+        f"\nwithin-week rho over {scoreable} scoreable weeks. The final week has no "
+        "future, so every outcome there is zero and it carries no ranking."
+    )
+    print("A learned model that does not beat `trailing production` on rho is not")
+    print("earning its complexity, whatever its absolute error looks like.")
     return 0
 
 

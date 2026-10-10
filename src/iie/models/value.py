@@ -73,14 +73,28 @@ CATEGORICAL_COLUMNS = ("position",)
 COMPONENTS = ("fantasy_points", "receptions")
 
 
-def add_horizon(panel: pd.DataFrame, *, final_week: int = FINAL_WEEK) -> pd.DataFrame:
-    """Attach ``weeks_remaining``: how many weeks the forward window can still cover.
+def add_horizon(
+    panel: pd.DataFrame, *, final_week: int = FINAL_WEEK, horizon: int = 6
+) -> pd.DataFrame:
+    """Attach ``weeks_remaining``: how many weeks the forward window actually covers.
 
-    Deterministic from the calendar, so it is known at decision time and carries no
-    information about the outcome beyond the length of the window itself.
+    ``min(final_week - week, horizon)`` and not ``final_week - week``. The latter is
+    a strictly decreasing function of ``week``, which is already a feature, so a
+    tree ensemble gains nothing from it: the two were measured at correlation
+    -1.000 and an arm given both scored bit-identically to an arm given only one.
+    It was also simply wrong as described, reporting 17 weeks of window at week 1
+    where the window is 6 -- false on 61% of rows.
+
+    Clipping at ``horizon`` is what makes it informative: the value is flat across
+    weeks 1-12, where the window is full, and falls only over the last few weeks,
+    where it genuinely truncates. That shape is *not* a monotone transform of
+    ``week``, so it tells the model something ``week`` cannot.
+
+    Deterministic from the calendar either way, so it is known when a bid is placed
+    and is not lookahead.
     """
     out = panel.copy()
-    out["weeks_remaining"] = (final_week - out["week"]).clip(lower=0)
+    out["weeks_remaining"] = (final_week - out["week"]).clip(lower=0, upper=horizon)
     return out
 
 
@@ -217,6 +231,50 @@ class PositionalValue:
             {
                 component: table.reindex(index).fillna(self._fallbacks[component]).to_numpy()
                 for component, table in self._tables.items()
+            },
+            index=frame.index,
+        )
+
+    def predict_points(
+        self, frame: pd.DataFrame, reception_points: pd.Series | float = 0.0
+    ) -> np.ndarray:
+        parts = self.predict_components(frame)
+        rec = (
+            reception_points
+            if np.isscalar(reception_points)
+            else pd.Series(reception_points, index=frame.index).to_numpy()
+        )
+        return parts["fantasy_points"].to_numpy() + rec * parts["receptions"].to_numpy()
+
+
+class TrailingProduction:
+    """Baseline: recent production per week, scaled to the remaining window.
+
+    **This, not the positional mean, is the bar a value model has to clear.** It
+    fits nothing, reads two columns the model already has, and on the 2025 test
+    season it ranks better *within every week* than the first version of
+    ``ValueModel`` did -- 0.780 against 0.637 mean within-week Spearman, winning in
+    all 17 scoreable weeks. A learned model that cannot beat it is not earning its
+    complexity, however good its absolute error looks.
+
+    Absolute error is the trap here, and CLAUDE.md invariant 6 names it: the target
+    is ~80% zeros, so predicting zero everywhere scores MAE 5.19 while the
+    positional mean scores 6.37. A baseline can lose to *nothing* on MAE and the
+    comparison still look favourable.
+    """
+
+    def __init__(self, window: int = 3) -> None:
+        self.window = window
+
+    def fit(self, panel: pd.DataFrame) -> TrailingProduction:
+        return self  # Nothing to fit; the signature exists so arms are swappable.
+
+    def predict_components(self, frame: pd.DataFrame) -> pd.DataFrame:
+        weeks = frame["weeks_remaining"].clip(lower=0).to_numpy()
+        return pd.DataFrame(
+            {
+                component: frame[f"{component}_l{self.window}"].to_numpy() / self.window * weeks
+                for component in COMPONENTS
             },
             index=frame.index,
         )
