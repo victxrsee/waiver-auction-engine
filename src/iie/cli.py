@@ -290,6 +290,7 @@ def cmd_value(args: argparse.Namespace) -> int:
         ValueModel,
         add_horizon,
         evaluate_value,
+        top_k_realized,
     )
     from .sources.nflverse import NflverseCache
 
@@ -318,30 +319,44 @@ def cmd_value(args: argparse.Namespace) -> int:
         "trailing production": TrailingProduction(),
         "value model": ValueModel(horizon=args.horizon),
     }
-    # Ordered worst-metric-first on purpose. within-week Spearman leads because it is
-    # the decision: which claim to make from the set available this week. MAE is
-    # reported last and only for reference -- CLAUDE.md invariant 6 forbids ranking on
-    # it, and the target is ~80% zeros, so "constant zero" beats a real baseline on
-    # it while being useless. Read down the Spearman column, not the MAE one.
-    print(f"\n{'model':22s} {'within-week rho':>16s} {'RMSE':>9s} {'MAE (do not rank)':>19s}")
-    scoreable = 0
+    # Scored on the waiver pool, not on every NFL player. A manager chooses among
+    # plausibly available players, and pooling in established starters flatters
+    # every arm equally while hiding differences where the decision is made.
+    pool = test[f"fantasy_points_l{args.pool_window}"] <= args.pool_threshold
+    pooled_test, pooled_truth = test[pool], truth[pool]
+    log.info("waiver pool: %d of %d test rows", len(pooled_test), len(test))
+
+    # top-k leads because it is the decision: what the few players you actually
+    # claimed went on to return. Spearman is reported beside it and must not be read
+    # as the headline -- on this pool a predictor that leaves 91% of rows tied at
+    # zero scores 0.780 while picking visibly worse players. MAE is worse still;
+    # CLAUDE.md invariant 6 forbids ranking on it at all.
+    print(
+        f"\n{'model':22s} {f'top-{args.k} points':>15s} {'within-week rho':>16s} "
+        f"{'RMSE':>9s} {'MAE':>8s}"
+    )
+    oracle = floor = None
     for name, model in arms.items():
         if model is None:
-            predicted = np.zeros(len(test))
+            predicted = np.zeros(len(pooled_test))
         else:
-            predicted = model.fit(train).predict_points(test, args.reception_points)
-        got = evaluate_value(predicted, truth, groups=test["week"])
+            fitted = model.fit(train)
+            predicted = fitted.predict_points(pooled_test, args.reception_points)
+        picks = top_k_realized(predicted, pooled_truth, pooled_test["week"], k=args.k)
+        got = evaluate_value(predicted, pooled_truth, groups=pooled_test["week"])
         rho = got["spearman_within_group"]
-        shown = "   n/a (constant)" if np.isnan(rho) else f"{rho:16.3f}"
-        print(f"{name:22s} {shown} {got['rmse']:9.2f} {got['mae']:19.2f}")
-        scoreable = max(scoreable, int(got["groups_ranked"]))
+        shown = "  n/a (constant)" if np.isnan(rho) else f"{rho:16.3f}"
+        print(f"{name:22s} {picks['top_k']:15.2f} {shown} {got['rmse']:9.2f} {got['mae']:8.2f}")
+        oracle, floor = picks["oracle"], picks["floor"]
 
+    print(f"\n{'perfect foresight':22s} {oracle:15.2f}")
+    print(f"{'pool average':22s} {floor:15.2f}")
     print(
-        f"\nwithin-week rho over {scoreable} scoreable weeks. The final week has no "
-        "future, so every outcome there is zero and it carries no ranking."
+        f"\ntop-{args.k} is the mean realised points of the {args.k} players each model "
+        f"would have\nclaimed each week, over {int(picks['groups_scored'])} weeks. Read that "
+        "column, not Spearman:\na predictor that declines to order the 88% of the pool "
+        "which returns nothing\nscores well on rank while choosing worse players."
     )
-    print("A learned model that does not beat `trailing production` on rho is not")
-    print("earning its complexity, whatever its absolute error looks like.")
     return 0
 
 
@@ -483,6 +498,14 @@ def build_parser() -> argparse.ArgumentParser:
     value.add_argument(
         "--reception-points", type=float, default=0.5, help="league scoring to report in"
     )
+    value.add_argument("--k", type=int, default=5, help="claims per week for the top-k metric")
+    value.add_argument(
+        "--pool-threshold",
+        type=float,
+        default=6.0,
+        help="trailing points at or below which a player counts as plausibly available",
+    )
+    value.add_argument("--pool-window", type=int, default=3, help="trailing window for the pool")
     value.set_defaults(func=cmd_value)
 
     audit = subparsers.add_parser("audit", help="check features for silent join defects")

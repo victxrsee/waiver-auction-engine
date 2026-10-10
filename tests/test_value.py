@@ -22,6 +22,7 @@ from iie.models.value import (
     ValueModel,
     add_horizon,
     evaluate_value,
+    top_k_realized,
 )
 
 
@@ -267,3 +268,66 @@ def test_a_group_with_no_ranking_information_is_skipped_not_scored_zero():
     out = evaluate_value(np.array([1.0, 2.0, 3.0, 1.0, 2.0, 3.0]), truth, groups=groups)
     assert out["groups_ranked"] == 1
     assert out["spearman_within_group"] == pytest.approx(1.0)
+
+
+# --- the decision metric, and the trap it replaced ---------------------------
+
+
+def test_top_k_averages_the_outcome_of_the_rows_it_would_have_picked():
+    truth = pd.Series([10.0, 0.0, 5.0, 0.0])
+    groups = pd.Series(["w1"] * 4)
+    # Ranks row 0 first and row 2 second, which realise 10 and 5.
+    got = top_k_realized(np.array([4.0, 1.0, 3.0, 2.0]), truth, groups, k=2)
+    assert got["top_k"] == pytest.approx(7.5)
+
+
+def test_a_perfect_ranking_reaches_the_oracle():
+    truth = pd.Series([1.0, 9.0, 3.0, 7.0])
+    groups = pd.Series(["w1"] * 4)
+    got = top_k_realized(truth.to_numpy(), truth, groups, k=2)
+    assert got["top_k"] == pytest.approx(got["oracle"])
+
+
+def test_the_oracle_and_floor_bracket_the_result():
+    """A bare "27.5 points" means nothing without the best and average available."""
+    rng = np.random.default_rng(0)
+    truth = pd.Series(rng.gamma(2, 3, 200))
+    groups = pd.Series(np.repeat(["w1", "w2"], 100))
+    got = top_k_realized(rng.random(200), truth, groups, k=5)
+    assert got["floor"] <= got["top_k"] <= got["oracle"]
+
+
+def test_a_group_smaller_than_k_is_skipped():
+    truth = pd.Series([1.0, 2.0, 5.0, 6.0, 7.0])
+    groups = pd.Series(["small", "small", "big", "big", "big"])
+    got = top_k_realized(np.arange(5.0), truth, groups, k=3)
+    assert got["groups_scored"] == 1
+
+
+def test_declining_to_discriminate_beats_spearman_and_loses_the_decision():
+    """The trap that made a one-line heuristic look better than the fitted model.
+
+    Most of a waiver pool returns nothing, so a predictor that leaves the whole
+    undifferentiated mass tied is scored on *matched* ties and rates well on rank --
+    while picking no better than chance. Measured on the real 2025 pool, trailing
+    production left 91% of rows in one tie and scored 0.780 against the model's
+    0.656, yet its top-5 claims returned 23.5 points against 27.5.
+    """
+    rng = np.random.default_rng(0)
+    n = 600
+    truth = pd.Series(np.where(rng.random(n) < 0.88, 0.0, rng.gamma(3, 6, n)))
+    groups = pd.Series(np.repeat([f"w{i}" for i in range(6)], n // 6))
+
+    # Leaves every row tied; cannot pick, but matches the mass of zeros.
+    blunt = np.zeros(n)
+    # Orders the producers correctly and the rest arbitrarily.
+    sharp = truth.to_numpy() + rng.normal(0, 2, n)
+
+    blunt_rho = evaluate_value(blunt, truth, groups=groups)["spearman_within_group"]
+    sharp_rho = evaluate_value(sharp, truth, groups=groups)["spearman_within_group"]
+    assert np.isnan(blunt_rho), "a constant has no rank correlation at all"
+    assert sharp_rho > 0.5
+
+    blunt_pick = top_k_realized(blunt, truth, groups, k=5)["top_k"]
+    sharp_pick = top_k_realized(sharp, truth, groups, k=5)["top_k"]
+    assert sharp_pick > blunt_pick, "top-k must reward actually choosing well"

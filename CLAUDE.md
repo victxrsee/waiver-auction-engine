@@ -53,6 +53,14 @@ Violating any of these has caused a real, silent defect in this repo before.
 6. **Bidding policies are compared at a matched win rate**, never at matched
    confidence and never on MAE. Bidding more always wins more and costs more, so one
    axis must be pinned. MAE rewards never bidding, because the target is 78% zeros.
+7. **Value models are judged on top-k realised points, not on rank correlation.**
+   A manager claims a handful of players, they do not order the wire. Most of a
+   waiver pool returns nothing, so a predictor that leaves the undifferentiated mass
+   tied is scored on *matched* ties and rates well on Spearman while picking badly:
+   trailing production left 91% of the 2025 pool in one tie, scored 0.780 against
+   the fitted model's 0.656, and its top-5 claims returned 23.5 points against 27.5.
+   Always print the oracle and the pool average beside a top-k figure, or the number
+   means nothing.
 
 ## Evaluation protocol
 
@@ -83,15 +91,16 @@ sources/    cache.py (HTTP + TTL), sleeper.py, nflverse.py, playerids.py (3-tier
 crawl/      crawler.py (2-phase walk), frontier.py (SQLite state), store.py (Parquet)
 features/   asof.py (week boundary), panel.py (player-week grid),
             opportunity.py (depth/injury/demand), claims.py (assembles the claim table)
-models/     price.py (hurdle + baseline + policy simulation)
+models/     hurdle.py (shared classifier+regressor+quantiles), price.py (P: bid
+            schedule, policy simulation), value.py (V: components, top-k)
 eval/       clustered.py (block bootstrap, group k-fold, franchise chaining)
-cli.py      crawl | claims | evaluate | audit | status
+cli.py      crawl | claims | evaluate | value | audit | status
 ```
 
 ## Commands
 
 ```bash
-.venv/bin/python -m pytest tests/ -q     # 223 tests, no network needed
+.venv/bin/python -m pytest tests/ -q     # 251 tests, no network needed
 .venv/bin/ruff check src tests
 .venv/bin/ruff format src tests
 
@@ -113,7 +122,12 @@ behaviour, and their docstrings say what breaks if the behaviour regresses.
 
 ## Known gaps
 
-- **V is not built**, so the engine prices claims but cannot rank them.
+- **The decision layer is not built.** V and P exist but nothing combines them into
+  a ranked claim list with bid amounts.
+- **V beats its baselines on top-k but loses on rank correlation**, because the
+  baseline wins that metric through ties (see invariant 7). Taken at face value the
+  Spearman column says the model is not worth its complexity; it is, on the metric
+  that matches the decision.
 - **`depth_rank` is not comparable across schemas** — legacy `depth_team` has three
   levels, modern `pos_rank` runs 1–15.
 - **`_regular_season` prefers `season_type` on the column *existing*, not being
