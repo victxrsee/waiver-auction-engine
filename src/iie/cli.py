@@ -360,6 +360,116 @@ def cmd_value(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_decide(args: argparse.Namespace) -> int:
+    """Produce a ranked claim list with bid amounts for one league-week.
+
+    This is the whole engine in one call: V values the available players, P prices
+    them, and the decision layer trades one against the other. Both models are fitted
+    on data strictly before the week being decided.
+    """
+    import numpy as np
+    import pandas as pd
+
+    from .features.panel import add_forward, add_trailing, build_player_week, on_full_week_grid
+    from .models.decide import MarketImpliedRate, ReplacementLevel, rank_claims
+    from .models.price import HurdlePrice, build_auction_table
+    from .models.value import ValueModel, add_horizon
+    from .sources.nflverse import NflverseCache
+
+    paths = _paths(args.data)
+    source = args.claims or paths["claims"]
+    if not Path(source).exists():
+        log.error("no claim table at %s; run `iie claims` first", source)
+        return 1
+    claims = pd.read_parquet(source)
+
+    # Everything the models learn from must predate the week being decided. A
+    # within-season cut is the realistic condition -- you bid in week 10 knowing
+    # weeks 1-9 -- and it is also the only honest one here.
+    history = claims[(claims["season"] < args.season) | (claims["week"] < args.week)]
+    target = claims[(claims["season"] == args.season) & (claims["week"] == args.week)]
+    if args.league:
+        target = target[target["league_id"] == args.league]
+    else:
+        # A claim list is for one roster. Ranking across leagues repeats every player
+        # once per league, which is noise rather than a longer list.
+        first = target["league_id"].iloc[0]
+        log.info("no --league given; showing %s (of %d)", first, target["league_id"].nunique())
+        target = target[target["league_id"] == first]
+    if target.empty:
+        log.error(
+            "no claims for season %s week %s%s",
+            args.season,
+            args.week,
+            f" in league {args.league}" if args.league else "",
+        )
+        return 1
+    log.info("deciding %d claims from %d prior ones", len(target), len(history))
+
+    # P, on the price that had to be beaten.
+    auctions = build_auction_table(history)
+    price = HurdlePrice().fit(auctions, auctions["price_to_beat"])
+    schedule = price.bid_schedule(target)
+
+    # V, on the player panel rather than on claims -- see models/value.py.
+    cache = NflverseCache(paths["nflverse"])
+    seasons = sorted({int(s) for s in claims["season"].dropna().unique()})
+    panel = add_horizon(
+        add_forward(
+            add_trailing(on_full_week_grid(build_player_week(cache, seasons))), args.horizon
+        )
+    )
+    past = panel[panel["season"] < int(args.season)]
+    value = ValueModel(horizon=args.horizon).fit(past)
+    scored = add_horizon(target, horizon=args.horizon)
+    raw_points = value.predict_points(scored, scored["reception_points"])
+
+    # What claiming a player *gains*, not what he scores. Without this every
+    # productive player is an arbitrage, because the alternative is treated as zero.
+    replacement = ReplacementLevel(rank=args.replacement_rank).fit(
+        panel, value.predict_points(panel, args.reception_points)
+    )
+    value_points = replacement.subtract(scored, raw_points)
+    log.info(
+        "value over replacement: mean %.1f points (raw mean %.1f)",
+        float(np.mean(value_points)),
+        float(np.mean(raw_points)),
+    )
+
+    rate = MarketImpliedRate().fit(history)
+    ranked = rank_claims(
+        target.reset_index(drop=True),
+        price_schedule=schedule,
+        value_points=value_points,
+        rate=rate,
+    )
+
+    shown = ranked[ranked["claim"]].head(args.top)
+    print(
+        f"\nseason {args.season} week {args.week}"
+        f"{f' league {args.league}' if args.league else ' (all leagues)'}\n"
+    )
+    if shown.empty:
+        print("no claim has positive expected surplus at this exchange rate.")
+        return 0
+    print(
+        f"{'#':>3s} {'player':>12s} {'pos':>4s} {'bid':>7s} {'win%':>6s} "
+        f"{'value pts':>10s} {'surplus':>9s} {'cum spend':>10s}"
+    )
+    for i, row in enumerate(shown.itertuples(), start=1):
+        print(
+            f"{i:3d} {str(row.player_id)[:12]:>12s} {getattr(row, 'position', '')!s:>4s} "
+            f"{row.bid:7.4f} {100 * row.win_prob:5.1f}% {row.value_points:10.1f} "
+            f"{row.expected_surplus:9.4f} {row.cumulative_expected_spend:10.4f}"
+        )
+    print(
+        f"\n{int(ranked['claim'].sum())} of {len(ranked)} candidates clear a positive "
+        f"surplus. Bids are fractions of budget;\n'cum spend' is cumulative *expected* "
+        "cost, since a bid is only paid when it wins."
+    )
+    return 0
+
+
 def cmd_audit(args: argparse.Namespace) -> int:
     import pandas as pd
 
@@ -507,6 +617,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     value.add_argument("--pool-window", type=int, default=3, help="trailing window for the pool")
     value.set_defaults(func=cmd_value)
+
+    decide = subparsers.add_parser("decide", help="ranked claim list with bid amounts")
+    decide.add_argument("--claims", type=Path)
+    decide.add_argument("--season", default="2025")
+    decide.add_argument("--week", type=int, default=10)
+    decide.add_argument("--league", help="restrict to one league_id")
+    decide.add_argument("--top", type=int, default=15, help="rows to print")
+    decide.add_argument("--horizon", type=int, default=6)
+    decide.add_argument(
+        "--replacement-rank",
+        type=int,
+        default=12,
+        help="the Nth-best available player at a position counts as free; roughly "
+        "league size, since that is how far you fall by losing a claim",
+    )
+    decide.add_argument("--reception-points", type=float, default=0.5)
+    decide.set_defaults(func=cmd_decide)
 
     audit = subparsers.add_parser("audit", help="check features for silent join defects")
     audit.add_argument("--claims", type=Path)

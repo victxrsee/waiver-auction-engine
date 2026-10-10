@@ -53,7 +53,14 @@ Violating any of these has caused a real, silent defect in this repo before.
 6. **Bidding policies are compared at a matched win rate**, never at matched
    confidence and never on MAE. Bidding more always wins more and costs more, so one
    axis must be pinned. MAE rewards never bidding, because the target is 78% zeros.
-7. **Value models are judged on top-k realised points, not on rank correlation.**
+7. **A claim's value is its gain over replacement, never its raw projection.** A
+   manager who claims a 40-point player gains 40 minus what they would have started
+   instead. Treating the alternative as zero made *all 50,337* of one week's
+   candidates clear a positive surplus -- a statement about units, not a discovery.
+   Replacement is the Nth-best *available* player at that position (rank, not
+   quantile: the available pool's 90th percentile is 0.0 points for most
+   position-weeks, so a quantile barely subtracts anything).
+8. **Value models are judged on top-k realised points, not on rank correlation.**
    A manager claims a handful of players, they do not order the wire. Most of a
    waiver pool returns nothing, so a predictor that leaves the undifferentiated mass
    tied is scored on *matched* ties and rates well on Spearman while picking badly:
@@ -92,15 +99,16 @@ crawl/      crawler.py (2-phase walk), frontier.py (SQLite state), store.py (Par
 features/   asof.py (week boundary), panel.py (player-week grid),
             opportunity.py (depth/injury/demand), claims.py (assembles the claim table)
 models/     hurdle.py (shared classifier+regressor+quantiles), price.py (P: bid
-            schedule, policy simulation), value.py (V: components, top-k)
+            schedule, policy simulation), value.py (V: components, top-k),
+            decide.py (exchange rate, replacement level, surplus-maximising bids)
 eval/       clustered.py (block bootstrap, group k-fold, franchise chaining)
-cli.py      crawl | claims | evaluate | value | audit | status
+cli.py      crawl | claims | evaluate | value | decide | audit | status
 ```
 
 ## Commands
 
 ```bash
-.venv/bin/python -m pytest tests/ -q     # 251 tests, no network needed
+.venv/bin/python -m pytest tests/ -q     # 278 tests, no network needed
 .venv/bin/ruff check src tests
 .venv/bin/ruff format src tests
 
@@ -122,8 +130,13 @@ behaviour, and their docstrings say what breaks if the behaviour regresses.
 
 ## Known gaps
 
-- **The decision layer is not built.** V and P exist but nothing combines them into
-  a ranked claim list with bid amounts.
+- **The decision layer is a first cut.** `iie decide` produces a ranked claim list
+  with bids, but the exchange rate is market-implied (so it inherits the market's
+  overpayment as its reference level) and replacement level is calibrated only
+  roughly -- it moves mean claim value from 55.3 to 42.4 points, which still leaves
+  nearly every real claim clearing a positive surplus. There is also no budget
+  constraint across a season: claims are priced one week at a time with no cost
+  charged for spending early.
 - **V beats its baselines on top-k but loses on rank correlation**, because the
   baseline wins that metric through ties (see invariant 7). Taken at face value the
   Spearman column says the model is not worth its complexity; it is, on the metric

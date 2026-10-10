@@ -260,9 +260,7 @@ DEPTH_COLUMNS = ("depth_rank", "depth_size", "depth_promotion", "depth_is_starte
 PROMOTION_LOOKBACK = pd.Timedelta(days=7)
 
 
-def _asof_rank(
-    claims: pd.DataFrame, charts: pd.DataFrame, instants: pd.Series
-) -> pd.DataFrame:
+def _asof_rank(claims: pd.DataFrame, charts: pd.DataFrame, instants: pd.Series) -> pd.DataFrame:
     """The last chart published at or before each instant, per player.
 
     ``merge_asof`` on the raw timestamp rather than on a week label, because a week
@@ -333,9 +331,7 @@ def attach_depth_features(
         if frame.empty:
             return frame
         return (
-            frame.sort_values("pos_rank")
-            .drop_duplicates(keys, keep="first")
-            .reset_index(drop=True)
+            frame.sort_values("pos_rank").drop_duplicates(keys, keep="first").reset_index(drop=True)
         )
 
     timestamped = _one_per(charts[charts["dt"].notna()], ["gsis_id", "dt"])
