@@ -256,6 +256,56 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_value(args: argparse.Namespace) -> int:
+    """Train and score the value model on the nflverse player panel.
+
+    Deliberately independent of the crawled corpus: outcomes exist for every
+    player-week whether or not anyone bid, so training here avoids conditioning on
+    somebody having already wanted the player -- which is the selection the engine
+    exists to second-guess.
+    """
+    from .features.panel import add_forward, add_trailing, build_player_week, on_full_week_grid
+    from .models.value import PositionalValue, ValueModel, add_horizon, evaluate_value
+    from .sources.nflverse import NflverseCache
+
+    cache = NflverseCache(_paths(args.data)["nflverse"])
+    seasons = [int(s) for s in _seasons(args.seasons)]
+    panel = build_player_week(cache, seasons)
+    if panel.empty:
+        log.error("no player-week data for %s", seasons)
+        return 1
+    panel = add_horizon(add_forward(add_trailing(on_full_week_grid(panel)), args.horizon))
+
+    train = panel[panel["season"].isin([int(s) for s in _seasons(args.train)])]
+    test = panel[panel["season"].isin([int(s) for s in _seasons(args.test)])]
+    if train.empty or test.empty:
+        log.error("empty split: --train %s --test %s against %s", args.train, args.test, seasons)
+        return 1
+    log.info("train %d player-weeks | test %d", len(train), len(test))
+
+    truth = (
+        test[f"fantasy_points_next{args.horizon}"]
+        + args.reception_points * test[f"receptions_next{args.horizon}"]
+    )
+    arms = {
+        "positional baseline": PositionalValue(),
+        "value model": ValueModel(horizon=args.horizon),
+    }
+    print(f"\n{'model':22s} {'MAE':>8s} {'RMSE':>8s} {'Spearman':>10s} {'within-week':>12s}")
+    for name, model in arms.items():
+        predicted = model.fit(train).predict_points(test, args.reception_points)
+        got = evaluate_value(predicted, truth, groups=test["week"])
+        print(
+            f"{name:22s} {got['mae']:8.2f} {got['rmse']:8.2f} "
+            f"{got['spearman']:10.3f} {got['spearman_within_group']:12.3f}"
+        )
+    # Within-week ranking is the number that matters: the decision is which claim to
+    # make from the set available this week, so order inside a week beats level.
+    print("\nwithin-week Spearman is the decision-relevant figure; pooled is flattered")
+    print("by contrasts between early and late weeks that no manager ever faces.")
+    return 0
+
+
 def cmd_audit(args: argparse.Namespace) -> int:
     import pandas as pd
 
@@ -379,6 +429,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="also fit without the opportunity features, to price their contribution",
     )
     evaluate.set_defaults(func=cmd_evaluate)
+
+    value = subparsers.add_parser("value", help="train and score the value model V")
+    value.add_argument("--seasons", default="2023,2024,2025", help="panel seasons to build")
+    value.add_argument("--train", default="2023,2024")
+    value.add_argument("--test", default="2025")
+    value.add_argument("--horizon", type=int, default=6, help="outcome weeks after each row")
+    value.add_argument(
+        "--reception-points", type=float, default=0.5, help="league scoring to report in"
+    )
+    value.set_defaults(func=cmd_value)
 
     audit = subparsers.add_parser("audit", help="check features for silent join defects")
     audit.add_argument("--claims", type=Path)

@@ -31,7 +31,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
+
+from .hurdle import DEFAULT_QUANTILES, Hurdle, design_matrix, fit_vocabulary
 
 log = logging.getLogger(__name__)
 
@@ -148,52 +149,12 @@ def _design_matrix(
     vocabulary: dict[str, list[str]] | None = None,
     features: tuple[str, ...] = FEATURE_COLUMNS,
 ) -> pd.DataFrame:
-    """Feature matrix. Gradient boosting takes the NaNs natively, which matters
-    because defenses legitimately have no player features at all.
-
-    ``vocabulary`` pins the categorical levels recorded at fit time. Without it,
-    ``.astype("category")`` derives codes from whatever frame it is handed, so a
-    split missing a rare position renumbers every position above it and the model
-    is scored on integers it never saw. A single-row frame -- the actual inference
-    call -- is the degenerate case: every position becomes code 0.
-
-    ``features`` narrows the column set, which exists so a feature family can be
-    ablated through the same code path that trains the real model. Measuring what
-    a feature contributes by editing the module constant measures a different
-    program than the one that ships.
-    """
-    missing = [c for c in features if c not in frame.columns]
-    if missing:
-        raise KeyError(
-            f"declared features absent from the frame: {missing}. Add them upstream or "
-            f"remove them from FEATURE_COLUMNS -- silently training on fewer features "
-            f"than declared is how a feature goes missing unnoticed."
-        )
-
-    matrix = frame[list(features)].apply(pd.to_numeric, errors="coerce")
-
-    for column in CATEGORICAL_COLUMNS:
-        if column not in frame.columns:
-            continue
-        levels = None if vocabulary is None else vocabulary.get(column)
-        if levels is None:
-            matrix[column] = frame[column].astype("category").cat.codes.replace(-1, np.nan)
-            continue
-        # Explicit lookup rather than a CategoricalDtype cast: an unseen level maps
-        # to NaN, which the boosted trees handle natively, instead of shifting the
-        # codes of every level around it. Using "string" keeps nulls as nulls.
-        lookup = {level: code for code, level in enumerate(levels)}
-        matrix[column] = frame[column].astype("string").map(lookup).astype("Float64")
-    return matrix
+    """Price-model view of the shared design matrix. See :mod:`iie.models.hurdle`."""
+    return design_matrix(frame, features, vocabulary, CATEGORICAL_COLUMNS)
 
 
 def _fit_vocabulary(frame: pd.DataFrame) -> dict[str, list[str]]:
-    """Categorical levels observed at fit time, to be reused at predict time."""
-    return {
-        column: sorted(frame[column].dropna().astype(str).unique())
-        for column in CATEGORICAL_COLUMNS
-        if column in frame.columns
-    }
+    return fit_vocabulary(frame, CATEGORICAL_COLUMNS)
 
 
 class ComparablesPrice:
@@ -267,65 +228,40 @@ class BidSchedule:
 
 @dataclass
 class HurdlePrice:
-    """Classifier for whether anyone else bids, regressor for how much.
+    """The price model: a :class:`~iie.models.hurdle.Hurdle` plus a bid schedule.
 
-    Predicted price is ``P(contested) * E[price | contested]``, which is the
-    expected amount needed. A manager who wants to win with some confidence
-    should look at the upper tail of that instead, which is what ``predict_quantile``
-    is for.
+    Predicted price is ``P(contested) * E[price | contested]``, the expected amount
+    needed. A manager who wants to win at some rate should look at the upper tail
+    instead, which is what :meth:`predict_to_win` and :meth:`bid_schedule` are for.
     """
 
     seed: int = 0
-    # Conditional price quantiles are fitted on a grid and interpolated between,
-    # so no distributional shape has to be assumed for the tail.
-    quantile_levels: tuple[float, ...] = (0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99)
+    quantile_levels: tuple[float, ...] = DEFAULT_QUANTILES
     # Narrowing this is how a feature family is ablated; the fitted model carries
     # its own column list so predict cannot silently use a different one.
     features: tuple[str, ...] = FEATURE_COLUMNS
-    classifier: HistGradientBoostingClassifier | None = field(default=None, repr=False)
-    regressor: HistGradientBoostingRegressor | None = field(default=None, repr=False)
-    _quantile_models: list = field(default_factory=list, repr=False)
-    # Categorical levels seen at fit time, replayed at predict time so codes mean
-    # the same thing in both. Without this the model is scored on integers it was
-    # never fitted on.
-    _vocabulary: dict[str, list[str]] = field(default_factory=dict, repr=False)
+    _hurdle: Hurdle | None = field(default=None, repr=False)
 
     def fit(self, frame: pd.DataFrame, target: pd.Series) -> HurdlePrice:
-        self._vocabulary = _fit_vocabulary(frame)
-        matrix = _design_matrix(frame, self._vocabulary, self.features)
-        contested = (target > 0).astype(int)
-
-        self.classifier = HistGradientBoostingClassifier(
-            max_iter=200, learning_rate=0.06, random_state=self.seed
-        ).fit(matrix, contested)
-
-        # Fitted only where a contest happened; the zeros are the classifier's job.
-        hit = contested.to_numpy() == 1
-        self.regressor = HistGradientBoostingRegressor(
-            max_iter=200, learning_rate=0.06, random_state=self.seed
-        ).fit(matrix[hit], target[hit])
-
-        self._quantile_models = [
-            HistGradientBoostingRegressor(
-                loss="quantile",
-                quantile=level,
-                max_iter=200,
-                learning_rate=0.06,
-                random_state=self.seed,
-            ).fit(matrix[hit], target[hit])
-            for level in self.quantile_levels
-        ]
+        self._hurdle = Hurdle(
+            features=self.features,
+            categorical=CATEGORICAL_COLUMNS,
+            seed=self.seed,
+            quantile_levels=self.quantile_levels,
+        ).fit(frame, target)
         return self
 
+    # The fitted vocabulary is read by tests and by anything reproducing the
+    # encoding, so it stays reachable under its original name.
+    @property
+    def _vocabulary(self) -> dict[str, list[str]]:
+        return {} if self._hurdle is None else self._hurdle._vocabulary
+
     def predict_parts(self, frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-        matrix = _design_matrix(frame, self._vocabulary, self.features)
-        probability = self.classifier.predict_proba(matrix)[:, 1]
-        amount = np.clip(self.regressor.predict(matrix), 0.0, None)
-        return probability, amount
+        return self._hurdle.predict_parts(frame)
 
     def predict(self, frame: pd.DataFrame) -> np.ndarray:
-        probability, amount = self.predict_parts(frame)
-        return probability * amount
+        return self._hurdle.predict(frame)
 
     def predict_to_win(self, frame: pd.DataFrame, confidence: float = 0.8) -> np.ndarray:
         """What to bid to win with roughly ``confidence`` probability.
@@ -336,24 +272,16 @@ class HurdlePrice:
         nobody else bids, and the conditional price when somebody does.
 
         For a target ``q``, the quantile needed of the *conditional* distribution
-        is ``1 - (1 - q) / p`` where ``p`` is the chance of a contest. When that
-        is negative, ``q`` is already covered by the odds of facing nobody and a
-        minimal bid suffices. The conditional quantiles come from real quantile
-        regressions fitted on contested auctions, interpolated across the grid,
-        rather than from an assumed distributional shape.
+        is ``1 - (1 - q) / p`` where ``p`` is the chance of a contest. When that is
+        negative, ``q`` is already covered by the odds of facing nobody and a
+        minimal bid suffices.
         """
         return self.bid_schedule(frame).at(confidence)
 
     def bid_schedule(self, frame: pd.DataFrame) -> BidSchedule:
         """Run the models once, so a confidence sweep costs array arithmetic."""
-        matrix = _design_matrix(frame, self._vocabulary, self.features)
-        return BidSchedule(
-            probability=self.classifier.predict_proba(matrix)[:, 1],
-            grid=np.asarray(self.quantile_levels),
-            curves=np.column_stack(
-                [np.clip(model.predict(matrix), 0.0, None) for model in self._quantile_models]
-            ),
-        )
+        probability, grid, curves = self._hurdle.quantile_curves(frame)
+        return BidSchedule(probability=probability, grid=grid, curves=curves)
 
 
 def simulate_policy(
