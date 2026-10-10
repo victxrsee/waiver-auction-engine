@@ -128,10 +128,35 @@ class Frontier:
         self.db.commit()
         return cur.rowcount > 0
 
-    def next_leagues(self, state: str = "accepted", limit: int = 1) -> list[sqlite3.Row]:
+    def next_leagues(
+        self,
+        state: str = "accepted",
+        limit: int = 1,
+        seasons: tuple[str, ...] | None = None,
+    ) -> list[sqlite3.Row]:
+        """Queued leagues, shallowest and oldest first.
+
+        ``seasons`` restricts the queue to those seasons. Without it the order is
+        first-in-first-out, which means a newly discovered season is fetched only
+        after every league already queued: a crawl aimed at the live 2026 season
+        discovered 1,975 of its leagues and accepted 196, then fetched none of
+        them, because 2,342 accepted 2024/2025 leagues sat ahead in the queue.
+
+        Leagues whose season is still unknown are always included, so filtering
+        cannot make one permanently unreachable.
+        """
+        if not seasons:
+            return self.db.execute(
+                "SELECT league_id, season, depth FROM leagues WHERE state = ? "
+                "ORDER BY depth, rowid LIMIT ?",
+                (state, limit),
+            ).fetchall()
+
+        marks = ",".join("?" * len(seasons))
         return self.db.execute(
-            "SELECT league_id, season, depth FROM leagues WHERE state = ? ORDER BY depth, rowid LIMIT ?",
-            (state, limit),
+            "SELECT league_id, season, depth FROM leagues WHERE state = ? "
+            f"AND (season IN ({marks}) OR season IS NULL) ORDER BY depth, rowid LIMIT ?",
+            (state, *seasons, limit),
         ).fetchall()
 
     def set_league_state(

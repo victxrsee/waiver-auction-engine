@@ -87,3 +87,31 @@ def test_state_survives_reopening(tmp_path):
         assert f.counts()["users_pending"] == 1
         assert [r["user_id"] for r in f.next_users(5)] == ["b"]
         assert [r["league_id"] for r in f.next_leagues("accepted")] == ["L1"]
+
+
+def test_the_queue_can_be_filtered_to_a_season(tmp_path):
+    """--seasons must govern what is fetched, not only what is screened.
+
+    A crawl aimed at the live 2026 season discovered 1,975 of its leagues and
+    accepted 196, then fetched none: the queue is first-in-first-out and 2,342
+    accepted 2024/2025 leagues sat ahead of them.
+    """
+    with Frontier(tmp_path / "f.db") as frontier:
+        frontier.add_league("old1", "2025", state="accepted")
+        frontier.add_league("old2", "2025", state="accepted")
+        frontier.add_league("new1", "2026", state="accepted")
+
+        unfiltered = frontier.next_leagues("accepted", 5)
+        assert [r["league_id"] for r in unfiltered] == ["old1", "old2", "new1"]
+
+        filtered = frontier.next_leagues("accepted", 5, seasons=("2026",))
+        assert [r["league_id"] for r in filtered] == ["new1"]
+
+
+def test_a_league_of_unknown_season_is_never_filtered_out(tmp_path):
+    """Season is backfilled at screening, but a league queued before that must not
+    become permanently unreachable just because a filter is in force."""
+    with Frontier(tmp_path / "f.db") as frontier:
+        frontier.add_league("unknown", None, state="accepted")
+        got = frontier.next_leagues("accepted", 5, seasons=("2026",))
+        assert [r["league_id"] for r in got] == ["unknown"]

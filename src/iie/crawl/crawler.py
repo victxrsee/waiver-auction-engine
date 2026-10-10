@@ -330,7 +330,11 @@ class Crawler:
         return False
 
     def _fetch_once(self) -> bool:
-        accepted = self.frontier.next_leagues("accepted", 1)
+        # Filtered by the policy's seasons, so --seasons governs what is *fetched*
+        # as well as what is screened. It used to govern only screening, which made
+        # a crawl aimed at a newly discovered season silently fetch none of it: the
+        # queue is FIFO, so 196 accepted 2026 leagues sat behind 2,342 older ones.
+        accepted = self.frontier.next_leagues("accepted", 1, seasons=self.policy.seasons)
         if not accepted:
             return False
         row = accepted[0]
