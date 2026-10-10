@@ -18,6 +18,14 @@ Sleeper reports *failed* claims with their amounts attached.
 The target is **78% zeros**, which is why the model is a hurdle: a classifier for
 whether anyone else bids, then quantile regressions for how much given that they do.
 
+**The opportunity features are built but deliberately not in the price model.**
+Depth-chart movement, injury status and cross-league demand live in
+`OPPORTUNITY_COLUMNS`, not `FEATURE_COLUMNS`: adding them costs
+`-0.0040 [-0.0042, -0.0039]` of budget per auction. They are carried through the
+claim table and audited, because they are the mispricing thesis and are expected in
+V. `iie evaluate --ablate` adds them back so the verdict stays re-checkable. Do not
+quietly move them into `FEATURE_COLUMNS` — a test pins this.
+
 ## Non-negotiable invariants
 
 Violating any of these has caused a real, silent defect in this repo before.
@@ -50,7 +58,18 @@ Violating any of these has caused a real, silent defect in this repo before.
 
 Train on **2025 weeks 1–9**, test on **weeks 10+**. Strictly past→future, and closer
 to deployment than a season split: you bid in week 10 knowing weeks 1–9, never
-knowing only last season.
+knowing only last season. `iie evaluate` runs this by default.
+
+**Exclude owner `479157902301458432` from any headline.** That one account holds 877
+of 3,256 leagues and they are a different market (27% of auctions contested against
+16%, three times the price, a flat $100 budget). Pooled, the positional baseline must
+average both regimes and gets both wrong, inflating the model's apparent margin past
+what it achieves in either population alone. `iie evaluate --exclude-owner <id>`.
+
+**Policies are read off the frontier, never at a single matched grid point.** That
+curve steps: two adjacent confidences once moved the headline from 42.9% to 22.2%.
+`policy_frontier` plus `spend_at_win_rate` interpolate to a common win rate and
+report the bracket; a wide bracket means the figure is fragile.
 
 Do **not** use train-2024 / test-2025 as evidence about a feature. The corpus is 85%
 one season, so that split fits ~22k auctions and scores ~369k across a season where
@@ -72,7 +91,7 @@ cli.py      crawl | claims | evaluate | audit | status
 ## Commands
 
 ```bash
-.venv/bin/python -m pytest tests/ -q     # 202 tests, no network needed
+.venv/bin/python -m pytest tests/ -q     # 223 tests, no network needed
 .venv/bin/ruff check src tests
 .venv/bin/ruff format src tests
 
@@ -95,6 +114,10 @@ behaviour, and their docstrings say what breaks if the behaviour regresses.
 ## Known gaps
 
 - **V is not built**, so the engine prices claims but cannot rank them.
+- **`depth_rank` is not comparable across schemas** — legacy `depth_team` has three
+  levels, modern `pos_rank` runs 1–15.
+- **`_regular_season` prefers `season_type` on the column *existing*, not being
+  *populated*** — the exact shape of the bug it was written to fix.
 - **Team defenses (12% of claims) are unpriceable** — they key on team abbreviation
   and need team-level stats, not a player join.
 - **Prices are conditional on a contest occurring**; a deployed engine faces the whole

@@ -38,6 +38,10 @@ def claim(league, week, player, bid, won, **kw):
         "total_rosters": 12,
         "reception_points": 0.5,
         "waiver_budget": 100.0,
+        # Present in the claim table but not in the price model's features. The
+        # auction table must still carry them, for the ablation and the analysis.
+        "depth_rank": kw.get("depth_rank", 2.0),
+        "demand_share": kw.get("demand_share", 0.1),
     }
     return row
 
@@ -91,6 +95,32 @@ def test_bidder_count_is_recorded_but_stays_out_of_the_features():
 
     assert "n_bidders" not in FEATURE_COLUMNS
     assert "n_winners" not in FEATURE_COLUMNS
+
+
+def test_the_opportunity_family_is_not_in_the_price_model():
+    """Measured harmful: adding it costs 0.0040 of budget per auction, taking the
+    spend reduction from 46.7% to 22.1%. It was in FEATURE_COLUMNS until three
+    separate artifacts that made it look useful were found and fixed.
+
+    Independent of the measurement, `demand_share` cannot be computed at decision
+    time -- it needs to know what other leagues did before your waiver ran -- and
+    evaluates to 0.0 on a single-row frame, which is the actual product call.
+    """
+    from iie.models.price import FEATURE_COLUMNS, OPPORTUNITY_COLUMNS
+
+    assert OPPORTUNITY_COLUMNS, "the family stays defined so --ablate can add it back"
+    assert not set(OPPORTUNITY_COLUMNS) & set(FEATURE_COLUMNS)
+
+
+def test_the_auction_table_still_carries_the_opportunity_columns(auctions):
+    """The model ignores them; the ablation and the mispricing analysis do not.
+    Dropping them from FEATURE_COLUMNS must not drop them from the data."""
+    from iie.models.price import OPPORTUNITY_COLUMNS
+
+    present = [c for c in OPPORTUNITY_COLUMNS if c in CLAIMS.columns]
+    assert present, "fixture should exercise at least one"
+    for column in present:
+        assert column in auctions.columns
 
 
 # --- baselines --------------------------------------------------------------

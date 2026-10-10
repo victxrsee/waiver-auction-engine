@@ -52,6 +52,12 @@ def cmd_crawl(args: argparse.Namespace) -> int:
         seasons=_seasons(args.seasons),
         target_leagues=args.target,
         max_requests=args.max_requests,
+        # An in-progress season has no complete leagues, so the completeness gate
+        # rejects every one of them. Prices are observable the moment a waiver
+        # clears, so a live season is usable for P even though its forward outcomes
+        # (and therefore V) are truncated.
+        require_complete=not args.include_incomplete,
+        expand_every=args.expand_every,
     )
 
     with Frontier(paths["frontier"]) as frontier, CorpusStore(paths["corpus"]) as store:
@@ -121,6 +127,27 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         return 1
 
     auctions = build_auction_table(pd.read_parquet(source))
+    if args.exclude_owner:
+        # One account holding 877 of 3,256 leagues ran a different market: 27% of
+        # auctions contested against 16%, three times the price, a flat $100 budget.
+        # Pooled, the positional baseline has to average both regimes and gets both
+        # wrong, which inflates every model's apparent margin past what it achieves
+        # in either population alone. The headline therefore excludes it, and this
+        # flag is how that figure is reproduced.
+        from .crawl.store import read_table
+
+        owners = read_table(_paths(args.data)["corpus"], "rosters")[["league_id", "owner_id"]]
+        drop = set(owners.loc[owners["owner_id"] == args.exclude_owner, "league_id"])
+        before = len(auctions)
+        auctions = auctions[~auctions["league_id"].isin(drop)]
+        log.info(
+            "excluded owner %s: %d leagues, %d auctions",
+            args.exclude_owner,
+            len(drop),
+            before - len(auctions),
+        )
+        if not drop:
+            log.warning("owner %s holds no leagues in this corpus", args.exclude_owner)
     if args.protocol == "week":
         # The protocol CLAUDE.md mandates, and the one the CLI could not previously
         # run: train on the early weeks of a season and predict its later ones. It
@@ -147,9 +174,12 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     base_bids = baseline.predict(test)
     base = simulate_policy(test, base_bids)
 
-    without = tuple(c for c in FEATURE_COLUMNS if c not in OPPORTUNITY_COLUMNS)
-    arms = {"hurdle (box score only)": without} if args.ablate else {}
-    arms["hurdle (full)"] = FEATURE_COLUMNS
+    # The shipping model is FEATURE_COLUMNS, which no longer carries the
+    # opportunity family. --ablate adds it back rather than taking it away, so the
+    # finding that it hurts stays re-checkable as the corpus grows.
+    arms = {"hurdle (price model)": FEATURE_COLUMNS}
+    if args.ablate:
+        arms["hurdle (+ opportunity)"] = FEATURE_COLUMNS + OPPORTUNITY_COLUMNS
 
     # Every arm is read off its own frontier at one common win rate -- the
     # baseline's. Snapping each arm to its nearest grid confidence instead landed
@@ -213,15 +243,15 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
 
     print(
         f"\nbudget saved per auction vs baseline (franchise-clustered): "
-        f"{spend_gap('baseline', 'hurdle (full)')}"
+        f"{spend_gap('baseline', 'hurdle (price model)')}"
     )
     if args.ablate:
-        # The Phase 1 question: do the opportunity features buy anything the box
-        # score did not already say? Positive means the full model bids less for
-        # the same wins. The interval is what decides it, not the point estimate.
+        # Does adding the opportunity family back buy anything? Positive would mean
+        # it bids less for the same wins. Measured 2026-09-07 it is negative, which
+        # is why it is not in the model. The interval decides, not the point.
         print(
             f"opportunity features, extra saving per auction: "
-            f"{spend_gap('hurdle (box score only)', 'hurdle (full)')}"
+            f"{spend_gap('hurdle (price model)', 'hurdle (+ opportunity)')}"
         )
     return 0
 
@@ -230,7 +260,7 @@ def cmd_audit(args: argparse.Namespace) -> int:
     import pandas as pd
 
     from .eval.audit import audit_features, format_report
-    from .models.price import CATEGORICAL_COLUMNS, FEATURE_COLUMNS
+    from .models.price import CATEGORICAL_COLUMNS, FEATURE_COLUMNS, OPPORTUNITY_COLUMNS
 
     paths = _paths(args.data)
     source = args.claims or paths["claims"]
@@ -253,7 +283,10 @@ def cmd_audit(args: argparse.Namespace) -> int:
 
     summary, findings = audit_features(
         claims,
-        FEATURE_COLUMNS + CATEGORICAL_COLUMNS,
+        # Opportunity columns are audited although the price model does not use
+        # them: they feed the mispricing analysis and are expected in the value
+        # model, so a join defect in one still matters.
+        FEATURE_COLUMNS + OPPORTUNITY_COLUMNS + CATEGORICAL_COLUMNS,
         split_col=split_col,
         categorical=CATEGORICAL_COLUMNS,
         ignore=ignore,
@@ -301,6 +334,17 @@ def build_parser() -> argparse.ArgumentParser:
     crawl.add_argument("--seasons", default=",".join(DEFAULT_SEASONS))
     crawl.add_argument("--rate", type=float, default=12.0, help="requests per second")
     crawl.add_argument("--max-requests", type=int, default=60_000)
+    crawl.add_argument(
+        "--include-incomplete",
+        action="store_true",
+        help="accept leagues whose season is still running (required for a live season)",
+    )
+    crawl.add_argument(
+        "--expand-every",
+        type=int,
+        default=8,
+        help="expand a new user every N fetches; lower favours discovery over depth",
+    )
     crawl.set_defaults(func=cmd_crawl)
 
     claims = subparsers.add_parser("claims", help="build the claim table from the corpus")
@@ -311,6 +355,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     evaluate = subparsers.add_parser("evaluate", help="train and score the price model")
     evaluate.add_argument("--claims", type=Path)
+    evaluate.add_argument(
+        "--exclude-owner",
+        help="drop every league containing this Sleeper owner_id (see cmd_evaluate)",
+    )
     evaluate.add_argument(
         "--protocol",
         choices=("week", "season"),

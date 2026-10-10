@@ -36,51 +36,71 @@ directly.
 Trained on 2025 weeks 1–9 and tested on weeks 10+ — strictly past to future, with
 franchise-clustered intervals throughout.
 
-> **The headline is withdrawn pending re-derivation (2026-09-07).** Three independent
-> defects were found in one day, each sufficient on its own to invalidate the number
-> that stood here. They are documented below because how they were found is more
-> useful than the figure they replaced.
+Bidding policies cannot be compared head-to-head — bidding more always wins more
+and costs more — so each is read off its own win-rate/spend frontier at one common
+contested win rate:
 
-**1. The depth-chart features read the future.** Each daily snapshot was labelled with
-the week that had *completed* when it was published, and a claim then joined the last
-snapshot carrying its `asof_week`. That label names a ~7-day bucket running from the
-end of week *W*'s games to the end of week *W+1*'s, and the claim sits at the near end
-of it. Measured across 707,398 joined rows: the snapshot a claim reads is published a
-median **5.0 days after that claim**, and is later than the claim **97.7%** of the
-time. Correcting it as-of drops `spearman(depth_rank, bid_pct)` from −0.061 to −0.025.
-The no-lookahead guard cannot see this — it compares week labels, which match by
-construction.
+| policy | mean bid (share of budget) | vs baseline |
+| --- | --- | --- |
+| comparables baseline (positional mean) | 0.0155 | — |
+| hurdle price model | **0.0083** | **46.7% less** |
+| the same, plus opportunity features | 0.0121 | 22.1% less |
 
-**2. The corpus is 27% one account.** A single Sleeper user belongs to 877 of 3,256
-leagues, and those leagues are structurally unlike the rest: 27% of auctions contested
-against 16%, mean price 0.038 against 0.014, and a standardised $100 budget against a
-median of $131. They are public mass-entry leagues, not leagues among friends. Any
-statistic over the pooled corpus is a blend of two markets in a ratio set by one
-crawler decision.
+Franchise-clustered saving of `+0.0073 [+0.0070, +0.0076]` of budget per auction.
+Reproduce with:
 
-**3. The comparison metric is unstable at the operating point.** Policies are compared
-at a matched contested win rate, swept over a confidence grid. That curve is not
-smooth: between two adjacent grid points the mean bid moves 36% and the reported
-spend reduction moves from 42.9% to 22.2%, and one step further the win rate jumps
-8 points at once. Two runs over nearly identical data matched on opposite sides of a
-step and reported 17.3% and 46.9% for the same policy.
+```bash
+iie evaluate --ablate --exclude-owner 479157902301458432
+```
 
-The pooled corpus also produces a spend reduction *larger than either population
-alone* — 47% pooled against 17% and 11% — which no better model can do. The
-positional-mean baseline degrades when averaging two price regimes, so that gain
-measures the baseline getting worse.
+**Why that exclusion is in the command.** One Sleeper account holds 877 of the 3,256
+leagues, and they are a different market: 27% of auctions contested against 16%, mean
+price 0.038 against 0.014, a flat $100 budget against a median of $131. Public
+mass-entry leagues, not leagues among friends. Pooled, the positional baseline has to
+average two price regimes and gets both wrong, which inflates the model's apparent
+margin to 47% — *more than it achieves in either population alone*, which no better
+model can do. That gain measures the baseline degrading, so the headline excludes it.
 
-What survives: the pipeline, the auction framing, the target choice, and the
-defect-finding apparatus that produced this list. The number does not.
+**Why the opportunity features are in the table but not in the model.** Depth-chart
+movement, injury status and cross-league demand were part of the model until three
+separate defects that made them look useful were found and fixed:
 
-**On the split.** An earlier version trained on 2024 and tested on 2025, which
-looks like the more conventional choice and is in fact the weaker one here: the
-corpus is 91% 2025, so that split fits 22k auctions and scores 369k, across a
-season where nflverse changed the depth-chart schema outright. Measured under it,
-the opportunity features appear to *hurt* — entirely an artifact of the mismatch.
-Training on early weeks and predicting later ones keeps the train-on-the-past
-discipline and is closer to deployment anyway: you bid in week 10 knowing weeks
-1–9, never knowing only last season.
+1. **They read the future.** Each daily depth-chart snapshot was labelled with the
+   week that had *completed* when it was published, and a claim joined the last
+   snapshot carrying its `asof_week`. That label names a ~7-day bucket ending after
+   the *following* week's games, and the claim sits at its near end. Across 707,398
+   joined rows the chart a claim read was published a median **5.0 days after that
+   claim**, and later than it **97.7%** of the time. The no-lookahead guard could not
+   see it: it compares week labels, which matched by construction. Fixed by joining
+   `merge_asof` on the claim's own instant — now 0.00%.
+2. **The corpus concentration above**, which inflated the baseline gap.
+3. **The comparison sat on a step.** Between two adjacent grid confidences the mean
+   bid moved 36% and the reported spend reduction moved 42.9% → 22.2%; one step
+   further the win rate jumped 8 points at once. Two runs over near-identical data
+   landed on opposite sides and reported 17.3% and 46.9% for the same policy. Fixed by
+   reading every arm off the frontier at one interpolated win rate, and printing the
+   bracket it was drawn from.
+
+With all three fixed, adding the family back costs `-0.0040 [-0.0042, -0.0039]`. They
+remain built, carried and audited — they are the empirical content of the mispricing
+thesis below, and belong in the value model rather than the price model. Two reasons
+hold independently of the measurement: `demand_share` is not computable at decision
+time (it needs to know what other leagues did before your waiver ran, and evaluates
+to 0.0 on the single-row frame that is the real product call), and `depth_rank` means
+different things in the two nflverse schemas.
+
+Every defect above made the result look **better**, which is why they survived: a
+disappointing number gets investigated and a pleasing one gets published.
+
+The baseline is self-built (mean price by position and week bucket) — not a
+commercial product and not human managers.
+
+**On the split.** An earlier version trained on 2024 and tested on 2025, which looks
+like the more conventional choice and is the weaker one here: the corpus is 85% 2025,
+so that split fits ~51k auctions and scores ~464k, across a season where nflverse
+changed the depth-chart schema outright. Training on early weeks and predicting later
+ones keeps the train-on-the-past discipline and is closer to deployment anyway — you
+bid in week 10 knowing weeks 1–9, never knowing only last season.
 
 ## Three problems worth reading the code for
 
@@ -180,7 +200,7 @@ deployed product.
 
 ## Tests
 
-202 tests, no network access required.
+223 tests, no network access required.
 
 ```bash
 .venv/bin/python -m pytest tests/ -q

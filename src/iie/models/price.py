@@ -57,20 +57,33 @@ FEATURE_COLUMNS = (
     "reception_points",
     "waiver_budget",
     "is_defense",
-    # Opportunity shocks. depth_promotion and demand_share are here because they
-    # move price hard while barely moving realized value -- a just-promoted starter
-    # costs 66% more and returns 26% less -- so a price model that cannot see them
-    # is blind to most of what the market is actually reacting to.
-    "depth_rank",
-    "depth_size",
-    "depth_promotion",
-    "depth_is_starter",
-    "demand_share",
-    "injury_severity",
 )
 
-# The Phase 1 additions, named so they can be ablated as a family. They are what
-# distinguishes "the market reacts to news" from "the market reacts to box scores".
+# Opportunity shocks: built, measured, and deliberately **not** in the price model.
+#
+# They were in FEATURE_COLUMNS until 2026-09-07, on the strength of a measurement
+# that said they helped. They do not. On the mandated protocol, with the depth
+# lookahead fixed and the one account holding 877 leagues excluded, adding them
+# costs 0.0040 [0.0042, 0.0039] of budget per auction -- the spend reduction falls
+# from 46.7% to 22.1%. Three separate artifacts had made them look useful: a depth
+# feature reading a chart published a median five days *after* the claim, a corpus
+# 27% composed of one atypical account, and a comparison snapped to a grid whose
+# steps moved the headline twenty points.
+#
+# Two reasons to keep them out even if a later measurement reverses that:
+#   * `demand_share` is not computable at decision time. Knowing what share of
+#     other leagues had claimed a player before your waiver ran requires crawling
+#     thousands of leagues live. It is a research instrument for measuring
+#     mispricing, not a deployable feature -- and on a single-row frame, which is
+#     the actual product call, it evaluates to 0.0.
+#   * `depth_rank` means different things in the two nflverse schemas: legacy
+#     `depth_team` has three levels, modern `pos_rank` runs 1-15.
+#
+# They stay defined, carried through the claim table, and audited, because they are
+# the empirical content of the mispricing thesis (the market pays +0.270 for hype
+# and -0.008 for durable role) and are expected to earn their place in the *value*
+# model, which asks how long an opportunity lasts rather than what it costs.
+# `iie evaluate --ablate` adds them back, so the verdict stays re-checkable.
 OPPORTUNITY_COLUMNS = (
     "depth_rank",
     "depth_size",
@@ -99,7 +112,19 @@ def build_auction_table(claims: pd.DataFrame) -> pd.DataFrame:
         "price_to_beat": ("losing_bid", "max"),
         "winning_bid": ("bid_pct", "max"),
     }
-    carried = [c for c in (*FEATURE_COLUMNS, *CATEGORICAL_COLUMNS, "franchise_id") if c in frame]
+    # Opportunity columns are carried even though the model does not use them: the
+    # ablation needs them present to add back, and the mispricing analysis reads
+    # them off the auction table.
+    carried = [
+        c
+        for c in (
+            *FEATURE_COLUMNS,
+            *OPPORTUNITY_COLUMNS,
+            *CATEGORICAL_COLUMNS,
+            "franchise_id",
+        )
+        if c in frame
+    ]
     for column in carried:
         aggregations[column] = (column, "first")
 
