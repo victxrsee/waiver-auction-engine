@@ -175,3 +175,45 @@ def test_season_split_refuses_overlap():
     frame = pd.DataFrame({"season": ["2024"], "x": [1]})
     with pytest.raises(ValueError, match="overlap"):
         season_split(frame, ["2024"], ["2024"])
+
+
+def test_a_statistic_that_regroups_on_the_cluster_id_is_inflated():
+    """A hazard worth a regression test, because it produced an interval that did
+    not contain its own point estimate (+704 true, against [+1071, +1155]).
+
+    Resampling draws whole clusters with replacement, so a cluster picked three
+    times appears as three copies of its rows. A statistic that then groups on the
+    cluster id collapses those copies into one group carrying triple the totals, so
+    the resampled distribution runs far above the truth while the full-sample
+    estimate stays correct -- which is why the symptom was a bad interval rather
+    than an obviously wrong number.
+
+    Note that `sum() / nunique()` is **also** wrong, and in the same direction: the
+    numerator grows with duplicates while the denominator shrinks. Pre-aggregating
+    to one row per cluster is the only form that resamples what it claims to.
+    """
+    clusters = pd.DataFrame(
+        {
+            "franchise_id": np.repeat(["f1", "f2", "f3", "f4"], 3),
+            "value": np.repeat([1.0, 3.0, 7.0, 9.0], 3),
+        }
+    )
+    totals = clusters.groupby("franchise_id", as_index=False)["value"].sum()
+
+    bad = block_bootstrap(
+        clusters, lambda s: float(s.groupby("franchise_id")["value"].sum().mean()), draws=400
+    )
+    good = block_bootstrap(totals, lambda s: float(s["value"].mean()), draws=400)
+
+    truth = float(totals["value"].mean())
+    assert bad.value == pytest.approx(truth) == pytest.approx(good.value)
+    assert good.ci_low <= truth <= good.ci_high, "the honest form brackets the truth"
+    assert bad.ci_high > 2 * good.ci_high - truth, "merged duplicates run far above it"
+
+
+def test_pre_aggregating_to_one_row_per_cluster_is_the_fix():
+    """With one row per cluster, resampling rows *is* resampling clusters."""
+    totals = pd.DataFrame({"franchise_id": ["f1", "f2", "f3", "f4"], "gap": [2.0, 4.0, 6.0, 8.0]})
+    got = block_bootstrap(totals, lambda f: float(f["gap"].mean()), draws=200)
+    assert got.ci_low <= got.value <= got.ci_high, "the interval must contain its estimate"
+    assert got.value == pytest.approx(5.0)

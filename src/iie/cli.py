@@ -470,6 +470,142 @@ def cmd_decide(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_backtest(args: argparse.Namespace) -> int:
+    """Replay the engine against what managers actually did, and report both arms.
+
+    The claim the whole project exists to test: does the engine acquire more realised
+    points per unit of FAAB than the people who were there?
+
+    Two limitations are structural rather than oversights, and the number means
+    nothing without them. The candidate set is *claims that someone actually made*,
+    so the engine never sees the player nobody wanted and should have -- that needs
+    free-agent pool reconstruction. And the rest of the market is held fixed, which
+    is right for one franchise of twelve and wrong for a policy everyone adopted,
+    because then the prices themselves would move.
+    """
+    import pandas as pd
+
+    from .eval.clustered import block_bootstrap
+    from .features.panel import add_forward, add_trailing, build_player_week, on_full_week_grid
+    from .models.decide import (
+        MarketImpliedRate,
+        ReplacementLevel,
+        backtest,
+        backtest_frontier,
+        backtest_summary,
+        optimal_bids,
+        per_franchise,
+        points_at_spend,
+    )
+    from .models.price import HurdlePrice, build_auction_table
+    from .models.value import ValueModel, add_horizon
+    from .sources.nflverse import NflverseCache
+
+    paths = _paths(args.data)
+    source = args.claims or paths["claims"]
+    if not Path(source).exists():
+        log.error("no claim table at %s; run `iie claims` first", source)
+        return 1
+    claims = pd.read_parquet(source)
+    if args.exclude_owner:
+        from .crawl.store import read_table
+
+        owners = read_table(paths["corpus"], "rosters")[["league_id", "owner_id"]]
+        drop = set(owners.loc[owners["owner_id"] == args.exclude_owner, "league_id"])
+        claims = claims[~claims["league_id"].isin(drop)]
+
+    season = args.season
+    history = claims[(claims["season"] < season) | (claims["week"] <= args.cut)]
+    test = claims[(claims["season"] == season) & (claims["week"] > args.cut)]
+    if history.empty or test.empty:
+        log.error("empty split for season %s cut %s", season, args.cut)
+        return 1
+    log.info("fitting on %d claims, replaying %d", len(history), len(test))
+
+    auctions = build_auction_table(history)
+    price = HurdlePrice().fit(auctions, auctions["price_to_beat"])
+
+    cache = NflverseCache(paths["nflverse"])
+    seasons = sorted({int(s) for s in claims["season"].dropna().unique()})
+    panel = add_horizon(
+        add_forward(
+            add_trailing(on_full_week_grid(build_player_week(cache, seasons))), args.horizon
+        )
+    )
+    value = ValueModel(horizon=args.horizon).fit(panel[panel["season"] < int(season)])
+    replacement = ReplacementLevel(rank=args.replacement_rank).fit(
+        panel, value.predict_points(panel, args.reception_points)
+    )
+
+    scored = add_horizon(test.reset_index(drop=True), horizon=args.horizon)
+    raw = value.predict_points(scored, scored["reception_points"])
+    value_points = replacement.subtract(scored, raw)
+    rate = MarketImpliedRate().fit(history)
+
+    schedule = price.bid_schedule(scored)
+    rate_values = rate.points_per_budget(scored)
+
+    # One point is not a comparison: bidding more always wins more and costs more,
+    # so the engine is placed on the managers' own spend before its points count.
+    frontier = backtest_frontier(scored, schedule, value_points, rate_values)
+    target_spend = float(frontier["manager_spend"].iloc[0])
+    matched = points_at_spend(frontier, target_spend)
+
+    print(
+        f"\nseason {season}, weeks > {args.cut}: {len(scored):,} claims, "
+        f"{scored.franchise_id.nunique():,} franchises"
+    )
+    print("per-franchise means; a corpus sum would add mutually exclusive counterfactuals\n")
+    print(f"{'bid multiplier':>15s} {'budget spent':>13s} {'points':>10s}")
+    for row in frontier.itertuples():
+        print(f"{row.multiplier:15.2f} {row.engine_spend:13.4f} {row.engine_points:10.1f}")
+    print(
+        f"\n{'manager (actual)':>15s} {target_spend:13.4f} "
+        f"{frontier['manager_points'].iloc[0]:10.1f}"
+    )
+    print(
+        f"{'engine @ matched':>15s} {matched['spend']:13.4f} {matched['points']:10.1f}"
+        f"   (bracket {matched['bracket']:.1f} pts)"
+    )
+    if matched.get("extrapolated"):
+        print("WARNING: the managers' spend lies outside the swept frontier")
+
+    manager_points = float(frontier["manager_points"].iloc[0])
+    gain = matched["points"] - manager_points
+    print(
+        f"\npoints gained at the managers' own spend: {gain:+.1f} per franchise "
+        f"({100 * gain / manager_points:+.1f}%)"
+    )
+
+    # Clustered interval at the matched operating point, on the policy printed above.
+    best = frontier.iloc[(frontier["engine_spend"] - target_spend).abs().argmin()]
+    decided = optimal_bids(schedule, value_points, rate_values / float(best["multiplier"]))
+    replayed = backtest(scored, decided["bid"].to_numpy())
+    got = backtest_summary(replayed)
+
+    # Pre-aggregated to one row per franchise, so resampling rows *is* resampling
+    # clusters. Grouping by franchise_id inside the statistic would collapse the
+    # duplicate copies a bootstrap draw creates and inflate the estimate -- measured
+    # at +704 true against an interval of [+1071, +1155], which does not contain it.
+    totals = per_franchise(replayed).reset_index()
+    totals["gap"] = totals["engine_points"] - totals["manager_points"]
+
+    estimate = block_bootstrap(totals, lambda frame: float(frame["gap"].mean()), draws=args.draws)
+    print(f"points per franchise, engine minus manager (franchise-clustered): {estimate}")
+    print(
+        f"\nefficiency is {got['engine_points_per_budget']:.0f} against "
+        f"{got['manager_points_per_budget']:.0f} points per unit of budget, which is NOT\n"
+        "the headline: that ratio's denominator is the policy's own choice, and bidding\n"
+        "zero everywhere wins the 78.6% of claims nobody contests for nothing at all."
+    )
+    print(
+        "\nCandidates are claims someone actually made, so the engine never sees the\n"
+        "player nobody wanted. The rest of the market is held fixed, which is right\n"
+        "for one franchise of twelve and wrong for a policy everyone adopted."
+    )
+    return 0
+
+
 def cmd_audit(args: argparse.Namespace) -> int:
     import pandas as pd
 
@@ -634,6 +770,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     decide.add_argument("--reception-points", type=float, default=0.5)
     decide.set_defaults(func=cmd_decide)
+
+    backtest_cmd = subparsers.add_parser("backtest", help="replay the engine against managers")
+    backtest_cmd.add_argument("--claims", type=Path)
+    backtest_cmd.add_argument("--season", default="2025")
+    backtest_cmd.add_argument("--cut", type=int, default=9, help="last week used for fitting")
+    backtest_cmd.add_argument("--horizon", type=int, default=6)
+    backtest_cmd.add_argument("--replacement-rank", type=int, default=12)
+    backtest_cmd.add_argument("--reception-points", type=float, default=0.5)
+    backtest_cmd.add_argument("--exclude-owner")
+    backtest_cmd.add_argument("--draws", type=int, default=300)
+    backtest_cmd.set_defaults(func=cmd_backtest)
 
     audit = subparsers.add_parser("audit", help="check features for silent join defects")
     audit.add_argument("--claims", type=Path)

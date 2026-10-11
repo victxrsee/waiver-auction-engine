@@ -46,6 +46,11 @@ Violating any of these has caused a real, silent defect in this repo before.
 4. **Intervals are franchise-clustered.** Naive standard errors are **2.6× too narrow**
    here — one manager appears in many leagues. Use `eval/clustered.py:block_bootstrap`;
    franchises are chained across seasons via `previous_league_id` union-find.
+   **The statistic must not group by the cluster column.** Resampling draws whole
+   clusters, so one drawn three times appears as three copies of its rows; regrouping
+   on the cluster id merges them into a single group at triple the total. That
+   produced an interval not containing its own estimate (+704 against [+1071, +1155]).
+   `sum() / nunique()` is wrong the same way. Pre-aggregate to one row per cluster.
 5. **`data/` is never committed.** The corpus holds 4,267 real users' `user_id`s. It is
    gitignored; verify with `git ls-tree -r --name-only origin/main | grep ^data/`
    before any push that touches ignore rules. Identifying fields (display names,
@@ -102,13 +107,13 @@ models/     hurdle.py (shared classifier+regressor+quantiles), price.py (P: bid
             schedule, policy simulation), value.py (V: components, top-k),
             decide.py (exchange rate, replacement level, surplus-maximising bids)
 eval/       clustered.py (block bootstrap, group k-fold, franchise chaining)
-cli.py      crawl | claims | evaluate | value | decide | audit | status
+cli.py      crawl | claims | evaluate | value | decide | backtest | audit | status
 ```
 
 ## Commands
 
 ```bash
-.venv/bin/python -m pytest tests/ -q     # 278 tests, no network needed
+.venv/bin/python -m pytest tests/ -q     # 290 tests, no network needed
 .venv/bin/ruff check src tests
 .venv/bin/ruff format src tests
 

@@ -135,6 +135,13 @@ def block_bootstrap(
     ``statistic`` is applied to a resampled frame, so a paired comparison between
     two models is just a statistic returning their difference -- both are computed
     on the same resampled clusters, which is what makes the comparison paired.
+
+    **The statistic must not group by ``cluster_col``.** Resampling draws whole
+    clusters with replacement, so a cluster picked three times appears as three
+    copies of its rows; a statistic that regroups on the cluster id collapses those
+    copies back into one group carrying triple the totals, which inflates the result
+    and produces an interval that does not even contain the full-sample estimate.
+    Pre-aggregate to one row per cluster and take a row-level statistic instead.
     """
     if frame.empty:
         raise ValueError("cannot bootstrap an empty frame")

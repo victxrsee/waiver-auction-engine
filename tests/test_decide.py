@@ -350,3 +350,122 @@ def test_several_bids_on_one_player_collapse_to_one_recommendation():
     )
     assert len(ranked) == 2
     assert list(ranked["player_id"]) == ["star", "other"]
+
+
+# --- the backtest counterfactual ---------------------------------------------
+
+from iie.models.decide import (
+    backtest,
+    backtest_summary,
+    price_excluding_self,
+)
+
+
+def bids(*rows) -> pd.DataFrame:
+    """(player, franchise, bid, won, points) -> a one-league one-week claim table."""
+    return pd.DataFrame(
+        [
+            {
+                "league_id": "L1",
+                "season": "2025",
+                "week": 10,
+                "player_id": p,
+                "franchise_id": f,
+                "bid_pct": b,
+                "won": w,
+                "points_gained": pts,
+            }
+            for p, f, b, w, pts in rows
+        ]
+    )
+
+
+def test_the_leader_faces_the_runner_up_once_removed():
+    """Standing in for a manager means their bid leaves with them. Leaving it in
+    makes the engine outbid itself, which would understate it everywhere."""
+    frame = bids(("p1", "fA", 0.30, 1, 50.0), ("p1", "fB", 0.12, 0, 50.0))
+    got = price_excluding_self(frame)
+    assert got[0] == pytest.approx(0.12), "the leader faces the runner-up"
+    assert got[1] == pytest.approx(0.30), "the loser still faces the leader"
+
+
+def test_a_sole_bidder_faces_nothing():
+    frame = bids(("p1", "fA", 0.20, 1, 50.0))
+    assert price_excluding_self(frame)[0] == 0.0
+
+
+def test_a_tie_at_the_top_does_not_fall_when_one_leaves():
+    """Removing one of two equal top bids leaves the other there."""
+    frame = bids(("p1", "fA", 0.25, 1, 50.0), ("p1", "fB", 0.25, 0, 50.0))
+    got = price_excluding_self(frame)
+    assert got[0] == pytest.approx(0.25)
+    assert got[1] == pytest.approx(0.25)
+
+
+def test_prices_are_scoped_to_one_league_week_and_player():
+    """A bid in another league must never set the price in this one."""
+    frame = pd.concat(
+        [
+            bids(("p1", "fA", 0.10, 1, 5.0)),
+            bids(("p1", "fB", 0.90, 1, 5.0)).assign(league_id="L2"),
+        ],
+        ignore_index=True,
+    )
+    assert price_excluding_self(frame)[0] == 0.0, "L2's bid is not competition in L1"
+
+
+def test_the_engine_wins_by_strictly_exceeding_the_competing_bid():
+    frame = bids(("p1", "fA", 0.30, 1, 60.0), ("p1", "fB", 0.12, 0, 60.0))
+    # fA's engine bid must clear 0.12; 0.12 exactly is a tie, which is a loss.
+    tie = backtest(frame, np.array([0.12, 0.0]))
+    clear = backtest(frame, np.array([0.13, 0.0]))
+    assert not tie["engine_won"].iat[0]
+    assert clear["engine_won"].iat[0]
+    assert clear["engine_spend"].iat[0] == pytest.approx(0.13)
+    assert clear["engine_points"].iat[0] == pytest.approx(60.0)
+
+
+def test_an_uncontested_claim_is_won_for_nothing():
+    frame = bids(("p1", "fA", 0.40, 1, 30.0))
+    got = backtest(frame, np.array([0.0]))
+    assert got["engine_won"].iat[0]
+    assert got["engine_spend"].iat[0] == 0.0
+    assert got["engine_points"].iat[0] == pytest.approx(30.0)
+    # The manager overpaid for the same player, which is the edge being measured.
+    assert got["manager_spend"].iat[0] == pytest.approx(0.40)
+
+
+def test_the_manager_arm_is_observed_not_simulated():
+    """Their result is what actually happened; only the engine's is counterfactual."""
+    frame = bids(("p1", "fA", 0.05, 0, 70.0), ("p1", "fB", 0.50, 1, 70.0))
+    got = backtest(frame, np.array([0.0, 0.0]))
+    assert got["manager_points"].iat[0] == 0.0, "fA lost, so gained nothing"
+    assert got["manager_points"].iat[1] == pytest.approx(70.0)
+    assert got["manager_spend"].iat[1] == pytest.approx(0.50)
+
+
+def test_losing_costs_nothing_in_either_arm():
+    """First-price: you pay what you bid, and only when you win."""
+    frame = bids(("p1", "fA", 0.02, 0, 40.0), ("p1", "fB", 0.60, 1, 40.0))
+    got = backtest(frame, np.array([0.01, 0.0]))
+    assert got["engine_spend"].iat[0] == 0.0 and got["engine_points"].iat[0] == 0.0
+
+
+def test_the_summary_reports_both_arms_and_their_ratio():
+    frame = bids(("p1", "fA", 0.40, 1, 30.0), ("p2", "fA", 0.10, 1, 10.0))
+    got = backtest_summary(backtest(frame, np.array([0.0, 0.0])))
+    # Engine wins both uncontested for nothing; manager paid 0.50 for the same 40.
+    assert got["engine_points"] == pytest.approx(40.0)
+    assert got["engine_spend"] == 0.0
+    assert got["manager_points"] == pytest.approx(40.0)
+    assert got["manager_spend"] == pytest.approx(0.50)
+    assert got["manager_points_per_budget"] == pytest.approx(80.0)
+
+
+def test_efficiency_alone_can_be_won_by_barely_playing():
+    """Why the summary prints totals beside the ratio: one free claim is infinitely
+    efficient and an empty roster."""
+    frame = bids(("p1", "fA", 0.40, 1, 30.0), ("p2", "fB", 0.20, 1, 60.0))
+    got = backtest_summary(backtest(frame, np.array([0.0, 0.0])))
+    assert np.isnan(got["engine_points_per_budget"]), "spent nothing at all"
+    assert got["engine_points"] > 0

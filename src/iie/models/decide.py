@@ -299,3 +299,186 @@ def rank_claims(
     out["expected_spend"] = (out["bid"] * out["win_prob"]).where(out["claim"], 0.0)
     out["cumulative_expected_spend"] = out["expected_spend"].cumsum()
     return out
+
+
+AUCTION_SCOPE = ("league_id", "season", "week", "player_id")
+
+
+def price_excluding_self(claims: pd.DataFrame, *, bid_col: str = "bid_pct") -> np.ndarray:
+    """For each bid, the best *competing* bid once that bidder is removed.
+
+    The counterfactual the backtest needs, and the one place it is easy to make the
+    engine look worse than it is. Standing in for a manager means their bid leaves
+    the market with them: if they were the one who set the price to beat, the engine
+    faces the runner-up, not them. Leaving it in makes the engine outbid itself.
+
+    Ties are resolved the honest way: when two bidders share the top bid, removing
+    one still leaves the other there, so the price does not fall.
+    """
+    frame = pd.DataFrame(
+        {c: claims[c].to_numpy() for c in AUCTION_SCOPE if c in claims.columns}
+        | {"_bid": claims[bid_col].to_numpy(dtype=float)}
+    )
+    keys = [c for c in AUCTION_SCOPE if c in frame.columns]
+    grouped = frame.groupby(keys, sort=False)["_bid"]
+
+    top = grouped.transform("max").to_numpy()
+    # Second highest, which is what the leader faces once they step out.
+    second = grouped.transform(lambda s: s.nlargest(2).iloc[-1] if len(s) > 1 else 0.0)
+    second = np.where(grouped.transform("size").to_numpy() > 1, second.to_numpy(), 0.0)
+    ties_at_top = grouped.transform(lambda s: (s == s.max()).sum()).to_numpy()
+
+    sole_leader = (frame["_bid"].to_numpy() >= top) & (ties_at_top == 1)
+    return np.where(sole_leader, second, top)
+
+
+def backtest(
+    claims: pd.DataFrame,
+    engine_bid: np.ndarray,
+    *,
+    bid_col: str = "bid_pct",
+    outcome_col: str = "points_gained",
+) -> pd.DataFrame:
+    """Replay the engine against what each manager actually did, claim by claim.
+
+    Holds the rest of the market fixed, which is the right counterfactual for one
+    franchise of twelve: the engine's bid competes against the *observed* competing
+    bids. It would not be right for a policy every manager adopted, because then the
+    prices themselves would move.
+
+    Returns one row per claim with both arms' spend and points, so any aggregation --
+    overall, per franchise, per week -- is the caller's to choose.
+    """
+    out = claims.copy().reset_index(drop=True)
+    price = price_excluding_self(out, bid_col=bid_col)
+    bids = np.asarray(engine_bid, dtype=float)
+    contested = price > 0
+    points = out[outcome_col].to_numpy(dtype=float)
+
+    # Same rule the price model is scored under: a contested auction needs a strictly
+    # higher bid, and an uncontested one is won by any bid including zero.
+    engine_won = np.where(contested, bids > price, True)
+    # The manager's own outcome is observed, not simulated.
+    manager_won = out["won"].to_numpy() == 1
+
+    out["price_to_beat_excl_self"] = price
+    out["engine_bid"] = bids
+    out["engine_won"] = engine_won
+    out["engine_spend"] = np.where(engine_won, bids, 0.0)
+    out["engine_points"] = np.where(engine_won, points, 0.0)
+    out["manager_won"] = manager_won
+    out["manager_spend"] = np.where(manager_won, out[bid_col].to_numpy(dtype=float), 0.0)
+    out["manager_points"] = np.where(manager_won, points, 0.0)
+    return out
+
+
+def per_franchise(replayed: pd.DataFrame) -> pd.DataFrame:
+    """Totals per franchise, which is the only level at which they mean anything.
+
+    Each row of a replay is a separate counterfactual: "had *this* franchise used
+    the engine". Summing across rows therefore sums mutually exclusive worlds -- in
+    a three-bidder auction the engine stands in for each bidder and can win the same
+    player three times, while the manager arm caps at one win. Measured on 2025,
+    that is 53,453 extra chances across 168,545 auctions.
+
+    Within one franchise the rows are consistent, so a franchise total is sound and
+    an average across franchises is interpretable: what the typical manager would
+    have got. A corpus-wide sum is not.
+    """
+    keys = [c for c in ("franchise_id",) if c in replayed.columns]
+    if not keys:
+        raise KeyError("replayed claims need a franchise_id to aggregate honestly")
+    return replayed.groupby(keys, observed=True)[
+        ["engine_spend", "engine_points", "manager_spend", "manager_points"]
+    ].sum()
+
+
+def backtest_summary(replayed: pd.DataFrame) -> dict[str, float]:
+    """Mean per-franchise points and budget for both arms.
+
+    **Points per unit of budget is reported and must not be read as the headline.**
+    It is a ratio whose denominator the policy chooses, so it is won by barely
+    playing: bidding zero everywhere wins every uncontested claim -- 78.6% of them --
+    for nothing at all, which scored 262x the managers' efficiency while being no
+    kind of strategy. Compare at matched spend instead, which is what
+    :func:`backtest_frontier` exists for.
+    """
+    totals = per_franchise(replayed)
+
+    def arm(prefix: str) -> dict[str, float]:
+        spend = float(totals[f"{prefix}_spend"].mean())
+        points = float(totals[f"{prefix}_points"].mean())
+        return {
+            f"{prefix}_points": points,
+            f"{prefix}_spend": spend,
+            f"{prefix}_claims_won": float(replayed[f"{prefix}_won"].sum()),
+            f"{prefix}_points_per_budget": points / spend if spend > 0 else float("nan"),
+        }
+
+    out = {**arm("engine"), **arm("manager"), "franchises": float(len(totals))}
+    out["points_ratio"] = (
+        out["engine_points_per_budget"] / out["manager_points_per_budget"]
+        if out["manager_points_per_budget"] > 0
+        else float("nan")
+    )
+    return out
+
+
+def backtest_frontier(
+    claims: pd.DataFrame,
+    schedule: BidSchedule,
+    value_points: np.ndarray,
+    rate: np.ndarray,
+    *,
+    multipliers: np.ndarray | None = None,
+) -> pd.DataFrame:
+    """Mean per-franchise spend and points as the engine is made more aggressive.
+
+    One point is not a comparison. Bidding more always wins more and costs more, so
+    the engine has to be placed on the managers' spend before its points mean
+    anything -- the same discipline the price model is held to, for the same reason.
+
+    The knob is the exchange rate: dividing it makes a point worth more budget, so
+    the surplus-maximising bid rises. ``multiplier`` of 1 is the market-implied rate.
+    """
+    grid = (
+        np.array([0.25, 0.5, 1, 2, 4, 8, 16, 32, 64, 128], dtype=float)
+        if multipliers is None
+        else np.asarray(multipliers, dtype=float)
+    )
+    rows = []
+    for multiplier in grid:
+        decided = optimal_bids(schedule, value_points, np.asarray(rate) / multiplier)
+        totals = per_franchise(backtest(claims, decided["bid"].to_numpy()))
+        rows.append(
+            {
+                "multiplier": float(multiplier),
+                "engine_spend": float(totals["engine_spend"].mean()),
+                "engine_points": float(totals["engine_points"].mean()),
+                "manager_spend": float(totals["manager_spend"].mean()),
+                "manager_points": float(totals["manager_points"].mean()),
+            }
+        )
+    return pd.DataFrame(rows).sort_values("engine_spend").reset_index(drop=True)
+
+
+def points_at_spend(frontier: pd.DataFrame, spend: float) -> dict[str, float]:
+    """Engine points interpolated onto a given budget, with the bracket it came from.
+
+    The bracket matters: the frontier is sampled, not continuous, and a wide gap
+    around the matched point means the figure is soft however it was obtained. The
+    price model learned that the hard way.
+    """
+    usable = frontier.dropna(subset=["engine_spend", "engine_points"]).sort_values("engine_spend")
+    xs = usable["engine_spend"].to_numpy()
+    ys = usable["engine_points"].to_numpy()
+    if len(xs) == 0:
+        return {"points": float("nan"), "spend": spend, "bracket": float("nan")}
+    index = int(np.searchsorted(xs, spend))
+    low, high = max(index - 1, 0), min(index, len(xs) - 1)
+    return {
+        "points": float(np.interp(spend, xs, ys)),
+        "spend": float(spend),
+        "bracket": float(abs(ys[high] - ys[low])),
+        "extrapolated": float(not (xs[0] <= spend <= xs[-1])),
+    }
